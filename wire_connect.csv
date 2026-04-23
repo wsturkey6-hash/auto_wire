@@ -1,0 +1,6 @@
+# autowire_v3 connections file,,,
+# Format: wire_name , bit_width , src (HIER/PATH.port) , dst (HIER/PATH.port) , comment
+wire_name,bit_width,src,dst,comment
+test_a_wire,1,i2c_master_top.test_a,i2c_master_top/byte_controller.test_a,
+test_b_wire,1,i2c_master_top.test_b,i2c_master_top/byte_controller/bit_controller.test_b,
+test_c_wire,8,i2c_master_top.test_c,i2c_master_top/byte_controller/bit_controller.test_c,connect 8-bit bus
