@@ -627,7 +627,19 @@ def _bubble_up(db: RTLDatabase,
     and update instantiation connections at each parent.
     """
     if src_path == lca:
-        return   # signal already lives at LCA scope
+        # Source signal lives in the LCA module's own scope (e.g. a top-level
+        # port routed down into a sub-block). Drive the crossing wire directly
+        # from it, padding/truncating if the requested width differs.
+        lca_mod = db.mod_name_at(lca)
+        src_si  = db.sig_info(src_path, src_port)
+        if src_si and src_si.width != use_w:
+            rhs = (f"{{{use_w-src_si.width}'b0, {src_port}}}" if use_w > src_si.width
+                   else f"{src_port}[{use_w-1}:0]")
+        else:
+            rhs = src_port
+        cs.add_assign(lca_mod, wire_name, rhs,
+                      f'drive crossing wire from {src_port} at LCA scope')
+        return
 
     levels = _levels_between(src_path, lca)  # instance names from lca down to src
     # e.g. src=TOP/u_sb/u_sensor, lca=TOP  → levels=['u_sb','u_sensor']
@@ -707,7 +719,15 @@ def _bubble_down(db: RTLDatabase,
     then connect adapted_name to dst_port.
     """
     if dst_path == lca:
-        # dst lives at lca — nothing to thread down
+        # dst lives in the LCA module's own scope (e.g. a sub-block output
+        # routed up to a top-level output port). Connect the crossing wire to
+        # dst_port there, adding the output port if the module lacks it.
+        lca_mod = db.mod_name_at(lca)
+        lca_def = db.modules.get(lca_mod)
+        if not (lca_def and dst_port in lca_def.ports):
+            cs.add_port(lca_mod, dst_port, 'output', ws)
+        cs.add_assign(lca_mod, dst_port, adapted_name,
+                      f'drive LCA-scope {dst_port} from crossing wire')
         return
 
     levels = _levels_between(dst_path, lca)  # [inst_below_lca, ..., dst_inst]
@@ -1233,10 +1253,19 @@ ENDPOINT FORMAT
                 continue
             mod = db.modules.get(n.module_name)
             if mod and port not in mod.ports and port not in mod.wires:
-                # Soft warning, not fatal (port might be on an IP not in rtl-dir)
-                print(col(f'  WARN row {spec.row_num}: '
-                           f'{side} port "{port}" not found in module '
-                           f'"{n.module_name}" (may be external IP)', C.YELLOW))
+                if side == 'src':
+                    # A source must exist — you cannot drive a wire from a
+                    # signal that is not declared. Fatal.
+                    validation_errors.append(
+                        f'  Row {spec.row_num}: src port "{port}" not found in '
+                        f'module "{n.module_name}". A source signal must already '
+                        f'exist (add it to the RTL first).')
+                else:
+                    # Soft warning, not fatal: the tool creates missing dst
+                    # ports, or it may be on an IP not in rtl-dir.
+                    print(col(f'  WARN row {spec.row_num}: '
+                               f'{side} port "{port}" not found in module '
+                               f'"{n.module_name}" (may be external IP)', C.YELLOW))
 
     if validation_errors:
         print(col('\n  PATH VALIDATION ERRORS:', C.RED, C.BOLD))
