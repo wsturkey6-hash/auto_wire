@@ -1146,6 +1146,15 @@ def print_banner():
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
+    # The banner and status glyphs (✓ ⚠ box-drawing) are non-ASCII. On a
+    # console whose codec can't encode them (e.g. Windows cp950) printing them
+    # raises UnicodeEncodeError and crashes the run. Emit UTF-8 instead, and
+    # replace anything that still can't be encoded rather than aborting.
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
     ap = argparse.ArgumentParser(
         description='AutoWire v3: CSV-driven SoC point-to-point wiring',
         formatter_class=argparse.RawDescriptionHelpFormatter,
