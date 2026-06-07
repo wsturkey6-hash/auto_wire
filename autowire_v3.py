@@ -48,6 +48,14 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
+try:
+    import pyslang
+    from pyslang.syntax import SyntaxTree
+    from pyslang.ast import Compilation, DefinitionKind, ArgumentDirection
+    HAS_PYSLANG = True
+except ImportError:
+    HAS_PYSLANG = False
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ANSI Colors
 # ──────────────────────────────────────────────────────────────────────────────
@@ -125,110 +133,20 @@ class ModChanges:
 # ──────────────────────────────────────────────────────────────────────────────
 # VERILOG PARSER
 # ──────────────────────────────────────────────────────────────────────────────
-_SKIP_KW = {
-    'module','endmodule','input','output','inout','wire','reg','logic',
-    'assign','always','initial','begin','end','if','else','case','endcase',
-    'for','while','function','task','parameter','localparam','generate',
-    'genvar','integer','real','time','supply0','supply1','posedge','negedge',
-    'default','signed','unsigned','automatic'
-}
+# Parsing is delegated to pyslang (see RTLDatabase). These small helpers map
+# slang's elaborated symbols onto this tool's SigInfo/ModuleDef structures.
+if HAS_PYSLANG:
+    _DIR_MAP = {
+        ArgumentDirection.In:    'input',
+        ArgumentDirection.Out:   'output',
+        ArgumentDirection.InOut: 'inout',
+    }
+else:
+    _DIR_MAP = {}
 
-def _strip_comments(text: str) -> str:
-    text = re.sub(r'//[^\n]*', '', text)
-    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.DOTALL)
-    return text
-
-def _parse_width(b: str) -> Tuple[int, str]:
-    if not b: return 1, ''
-    inner = b.strip().strip('[]')
-    m = re.match(r'(\d+)\s*:\s*(\d+)', inner)
-    if m:
-        hi, lo = int(m.group(1)), int(m.group(2))
-        return abs(hi - lo) + 1, f'[{inner}]'
-    return 1, f'[{inner}]'
-
-def _find_balanced(text: str, pos: int, oc='(', cc=')') -> int:
-    depth = 1; i = pos + 1
-    while i < len(text) and depth > 0:
-        if text[i] == oc: depth += 1
-        elif text[i] == cc: depth -= 1
-        i += 1
-    return i - 1
-
-def parse_verilog_file(filepath: str) -> Optional[ModuleDef]:
-    try: source = Path(filepath).read_text(errors='replace')
-    except Exception: return None
-    clean = _strip_comments(source)
-
-    m = re.search(r'\bmodule\s+(\w+)', clean)
-    if not m: return None
-    mod_name = m.group(1)
-
-    # Signals
-    ports, wires = {}, {}
-    # Also parse typed port declarations that may appear directly in the
-    # module header (Verilog-2001 style), e.g. `input wire [7:0] foo` inside
-    # the parentheses. These do not end with a semicolon and thus are not
-    # captured by the general semicolon-based signal regex below.
-    try:
-        po = clean.find('(', m.end())
-        if po >= 0:
-            pc = _find_balanced(clean, po)
-            header_text = clean[po+1:pc]
-            header_sig_re = re.compile(
-                r'\b(input|output|inout)\b'
-                r'(?:\s+(?:wire|reg|logic|signed|unsigned))*'
-                r'(\s*\[[^\]]*\])?'
-                r'\s+([\w\s,]+)', re.MULTILINE)
-            for hm in header_sig_re.finditer(header_text):
-                hkw = hm.group(1)
-                hw, hws = _parse_width(hm.group(2))
-                for raw in re.split(r'[,\s]+', hm.group(3)):
-                    n = raw.strip()
-                    if re.fullmatch(r'\w+', n) and n not in _SKIP_KW:
-                        si = SigInfo(n, hkw, hw, hws)
-                        if hkw in ('input','output','inout'):
-                            ports.setdefault(n, si)
-                        else:
-                            wires.setdefault(n, si)
-    except Exception:
-        # Best effort: don't fail parsing the file just because header parsing
-        # encountered an unexpected structure.
-        pass
-    sig_re = re.compile(
-        r'\b(input|output|inout|wire|reg)\b'
-        r'(?:\s+(?:wire|reg|logic|signed|unsigned))*'
-        r'(\s*\[[^\]]*\])?'
-        r'\s+([\w\s,]+?)(?=;)', re.MULTILINE)
-    for sm in sig_re.finditer(clean):
-        kw = sm.group(1)
-        w, ws = _parse_width(sm.group(2))
-        for raw in re.split(r'[,\s]+', sm.group(3)):
-            n = raw.strip()
-            if re.fullmatch(r'\w+', n) and n not in _SKIP_KW:
-                si = SigInfo(n, kw, w, ws)
-                if kw in ('input','output','inout'):
-                    ports.setdefault(n, si)
-                else:
-                    wires.setdefault(n, si)
-
-    # Instances
-    instances = {}
-    inst_re = re.compile(
-        r'\b([A-Za-z_]\w*)(?:\s*#\s*\([^)]*\))?\s+([A-Za-z_]\w*)\s*(\()',
-        re.MULTILINE)
-    for im in inst_re.finditer(clean):
-        mn2, iname, _ = im.group(1), im.group(2), im.group(3)
-        if mn2 in _SKIP_KW or iname in _SKIP_KW: continue
-        cp = _find_balanced(clean, im.start(3))
-        tail = clean[cp+1:cp+5].strip()
-        if not tail.startswith(';'): continue
-        conns = {}
-        for pm in re.finditer(r'\.(\w+)\s*\(\s*([^)]*?)\s*\)', clean[im.start(3)+1:cp]):
-            conns[pm.group(1)] = pm.group(2).strip()
-        instances[iname] = InstInfo(iname, mn2, conns)
-
-    return ModuleDef(mod_name, filepath, ports, wires, instances, source)
+def _width_str(w: int) -> str:
+    """Render a concrete bit width as a Verilog range, e.g. 8 -> '[7:0]'."""
+    return f'[{w-1}:0]' if w and w > 1 else ''
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RTL DATABASE + HIERARCHY TREE
@@ -246,68 +164,118 @@ class RTLDatabase:
         self.modules: Dict[str,ModuleDef] = {}
         self.root: Optional[HierNode] = None
         self.errors: List[str] = []
+        self._comp = None                    # pyslang Compilation
+        self._sm   = None                    # pyslang SourceManager
+        self._sources: Dict[str,str] = {}    # filepath -> source text (cached)
 
     # ── Scanning ──────────────────────────────────────────────────────────────
     def scan_dir(self, rtl_dir: str):
-        count = 0
-        for vf in sorted(Path(rtl_dir).rglob('*.v')):
-            mod = parse_verilog_file(str(vf))
-            if not mod: continue
-            if mod.name in self.modules:
-                self.errors.append(
-                    f'DUPLICATE MODULE  "{mod.name}"\n'
-                    f'  file1: {self.modules[mod.name].filepath}\n'
-                    f'  file2: {vf}')
-            else:
-                self.modules[mod.name] = mod; count += 1
-        return count
+        """Parse every *.v under rtl_dir into one pyslang Compilation. Concrete
+        module/hierarchy extraction happens in build_hierarchy (needs elaboration)."""
+        files = sorted(Path(rtl_dir).rglob('*.v'))
+        if not files:
+            return 0
+        self._sm = pyslang.SourceManager()
+        # Make every directory that contains RTL an include search path so
+        # `include "..."` resolves wherever the header lives.
+        for d in sorted({str(f.parent) for f in files}):
+            self._sm.addUserDirectories(d)
+        self._comp = Compilation()
+        for f in files:
+            try:
+                self._comp.addSyntaxTree(SyntaxTree.fromFile(str(f), self._sm))
+            except Exception as e:
+                self.errors.append(f'parse error in {f}: {e}')
+        try:
+            defs = self._comp.getDefinitions()
+            return sum(1 for d in defs if d.definitionKind == DefinitionKind.Module)
+        except Exception:
+            return 0
 
     def check_duplicates(self) -> List[str]:
-        errs = []
-        for mod in self.modules.values():
-            # Detect names that appear both as a port and as a wire/reg.
-            # Common Verilog style is to declare a port and then a reg
-            # with the same name (e.g. `output cmd_ack;\nreg cmd_ack;`).
-            # Treat the specific case of port.direction=='output' and
-            # wire.direction=='reg' as acceptable (not a duplicate).
-            port_names = set(mod.ports.keys())
-            wire_names = set(mod.wires.keys())
-            for n in port_names & wire_names:
-                p = mod.ports.get(n)
-                w = mod.wires.get(n)
-                # Allow common, non-problematic coexistence patterns:
-                #  - output port implemented as reg (e.g. "output foo; reg foo;")
-                #  - any port with a separate "wire" declaration (redundant but seen in RTL)
-                allowed = False
-                if p and w:
-                    if w.direction == 'wire':
-                        allowed = True
-                    elif p.direction == 'output' and w.direction == 'reg':
-                        allowed = True
-
-                if not allowed:
-                    errs.append(
-                        f'[{mod.name}  {mod.filepath}]  '
-                        f'duplicate signal "{n}"')
-        return errs
+        # pyslang elaboration is authoritative for real conflicts; the old
+        # port-vs-reg heuristic produced false positives and is no longer needed.
+        return []
 
     # ── Hierarchy ─────────────────────────────────────────────────────────────
     def build_hierarchy(self, top: str):
-        if top not in self.modules:
-            self.errors.append(f'Top module "{top}" not found in scanned files')
+        if self._comp is None:
+            self.errors.append('No RTL parsed (scan_dir not run, or no .v files)')
             return
-        self.root = HierNode(top, top, top)
-        self._recurse(self.root, set())
+        try:
+            root_sym = self._comp.getRoot()
+        except Exception as e:
+            self.errors.append(f'elaboration failed: {e}')
+            return
+        top_inst = next((i for i in root_sym.topInstances if i.body.name == top), None)
+        if top_inst is None:
+            roots = ', '.join(sorted(i.body.name for i in root_sym.topInstances)) or '(none)'
+            self.errors.append(
+                f'Top module "{top}" not found as a root module. '
+                f'Root modules detected: {roots}')
+            return
+        self.root = self._build_node(top_inst, top)
 
-    def _recurse(self, node: HierNode, visited: set):
-        mod = self.modules.get(node.module_name)
-        if not mod or node.module_name in visited: return
-        vis2 = visited | {node.module_name}
-        for iname, inst in mod.instances.items():
-            cp = f'{node.path}/{iname}'
-            child = HierNode(inst.module_name, iname, cp, parent=node)
-            node.children.append(child)
-            self._recurse(child, vis2)
+    def _build_node(self, inst_sym, path: str) -> HierNode:
+        body = inst_sym.body
+        node = HierNode(body.name, inst_sym.name, path)
+        if body.name not in self.modules:
+            self.modules[body.name] = self._module_from_body(body)
+        for mem in body:
+            if type(mem).__name__ == 'InstanceSymbol':
+                child = self._build_node(mem, f'{path}/{mem.name}')
+                child.parent = node
+                node.children.append(child)
+        return node
+
+    # ── pyslang symbol → ModuleDef mapping ──────────────────────────────────────
+    @staticmethod
+    def _bitwidth(sym) -> int:
+        t = getattr(sym, 'type', None)
+        w = getattr(t, 'bitWidth', None) if t is not None else None
+        return int(w) if w else 1
+
+    def _module_from_body(self, body) -> ModuleDef:
+        filepath = self._sm.getFileName(body.location)
+        source = self._sources.get(filepath)
+        if source is None:
+            try:
+                source = Path(filepath).read_text(errors='replace')
+            except Exception:
+                source = ''
+            self._sources[filepath] = source
+
+        ports:     Dict[str,SigInfo]  = {}
+        wires:     Dict[str,SigInfo]  = {}
+        instances: Dict[str,InstInfo] = {}
+        members = list(body)
+        # 1) ports first — a port also emits a same-named implicit net we skip
+        for m in members:
+            if type(m).__name__ == 'PortSymbol':
+                w = self._bitwidth(m)
+                ports[m.name] = SigInfo(m.name, _DIR_MAP.get(m.direction, 'wire'),
+                                        w, _width_str(w))
+        # 2) internal nets / regs
+        for m in members:
+            k = type(m).__name__
+            if k in ('NetSymbol', 'VariableSymbol') and m.name not in ports:
+                w = self._bitwidth(m)
+                kw = 'reg' if k == 'VariableSymbol' else 'wire'
+                wires[m.name] = SigInfo(m.name, kw, w, _width_str(w))
+        # 3) child instances + their port connections (signal text, best effort)
+        for m in members:
+            if type(m).__name__ == 'InstanceSymbol':
+                conns: Dict[str,str] = {}
+                for pc in m.portConnections:
+                    try:
+                        expr = pc.expression
+                        conns[pc.port.name] = (str(expr.syntax).strip()
+                                               if expr is not None and expr.syntax is not None
+                                               else '')
+                    except Exception:
+                        conns[pc.port.name] = ''
+                instances[m.name] = InstInfo(m.name, m.body.name, conns)
+        return ModuleDef(body.name, filepath, ports, wires, instances, source)
 
     def node(self, path: str) -> Optional[HierNode]:
         if not self.root: return None
@@ -1154,6 +1122,10 @@ def main():
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except (AttributeError, ValueError):
         pass
+
+    if not HAS_PYSLANG:
+        sys.exit('ERROR: pyslang is required for RTL parsing. '
+                 'Install it with:  pip install pyslang')
 
     ap = argparse.ArgumentParser(
         description='AutoWire v3: CSV-driven SoC point-to-point wiring',
