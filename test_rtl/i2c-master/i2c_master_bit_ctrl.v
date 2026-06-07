@@ -167,9 +167,7 @@ module i2c_master_bit_ctrl (
     input             sl_wait,
     output            slave_reset
 
-,  // aw:willy 2026-04-21
-    input wire test_b,  // aw:willy 2026-04-21
-    input wire [7:0] test_c);
+);
 
 
     //
@@ -724,14 +722,4 @@ module i2c_master_bit_ctrl (
     // assign scl and sda output (always gnd)
     assign scl_o = 1'b0;
     assign sda_o = 1'b0;
-
-
-// AUTO_WIRE_BEGIN  user:willy  date:2026-04-21  tool:autowire_v3.py
-
-// --- Ports added to module header (listed for reference) ----
-//   input wire test_b
-//   input wire [7:0] test_c
-
-// AUTO_WIRE_END
-
 endmodule

@@ -77,14 +77,7 @@ module i2c_master_byte_ctrl
 
    //test port
    test_a
- ,  // aw:willy 2026-04-21
-    test_b_wire,  // aw:willy 2026-04-21
-    test_c_wire);
-// aw:willy 2026-04-21
-    input wire test_b_wire;
-// aw:willy 2026-04-21
-    input wire [7:0] test_c_wire;
-
+ );
 
 
 
@@ -213,9 +206,7 @@ module i2c_master_byte_ctrl
 		.cmd_slave_ack (slave_ack),
 		.slave_cmd (slave_cmd_out),
 		.sl_wait (sl_wait),
-		.slave_reset (slave_reset),  // aw:willy 2026-04-21
-    .test_b                                   ( test_b_wire ),  // aw:willy 2026-04-21
-    .test_c                                   ( test_c_wire ));
+		.slave_reset (slave_reset));
 
 	reg 		slave_adr_received_d;
 	// generate go-signal
@@ -523,12 +514,4 @@ module i2c_master_byte_ctrl
 
 	      endcase
 	  end
-// AUTO_WIRE_BEGIN  user:willy  date:2026-04-21  tool:autowire_v3.py
-
-// --- Ports added to module header (listed for reference) ----
-//   input wire test_b_wire
-//   input wire [7:0] test_c_wire
-
-// AUTO_WIRE_END
-
 endmodule

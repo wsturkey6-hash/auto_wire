@@ -278,11 +278,7 @@ module i2c_master_top
 		.slave_dat_req (slave_dat_req),
 		.slave_dat_avail (slave_dat_avail),
 		.slave_act (slave_act),
-		.slave_cmd_ack (slave_done),
-
-		.test_a ( test_a_wire ),  // aw:willy 2026-04-21
-    .test_b_wire                              ( test_b_wire ),  // aw:willy 2026-04-21
-    .test_c_wire                              ( test_c_wire ));
+		.slave_cmd_ack (slave_done));
 
 	// status register block + interrupt request signal
 	always @(posedge wb_clk_i or negedge rst_i)
@@ -335,14 +331,4 @@ module i2c_master_top
 	assign sr[2]   = slave_dat_req;
 	assign sr[1]   = tip;
 	assign sr[0]   = irq_flag;
-
-// AUTO_WIRE_BEGIN  user:willy  date:2026-04-21  tool:autowire_v3.py
-
-// --- Crossing / adapter wire declarations ---------------------
-wire test_a_wire;
-wire test_b_wire;
-wire [7:0] test_c_wire;
-
-// AUTO_WIRE_END
-
 endmodule
