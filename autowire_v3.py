@@ -183,7 +183,19 @@ class RTLDatabase:
         self._comp = Compilation()
         for f in files:
             try:
-                self._comp.addSyntaxTree(SyntaxTree.fromFile(str(f), self._sm))
+                raw = Path(f).read_text(errors='replace')
+            except Exception as e:
+                self.errors.append(f'read error in {f}: {e}')
+                continue
+            # Parse the design as if the tool had never run: strip our own
+            # AUTO_WIRE content first, so every run sees the pristine RTL and
+            # re-application is idempotent. The pristine text is also what the
+            # write-back edits, keyed by the file path.
+            clean = _strip_all_aw_content(raw)
+            self._sources[str(f)] = clean
+            try:
+                self._comp.addSyntaxTree(
+                    SyntaxTree.fromText(clean, self._sm, str(f), str(f)))
             except Exception as e:
                 self.errors.append(f'parse error in {f}: {e}')
         try:
@@ -239,8 +251,10 @@ class RTLDatabase:
         filepath = self._sm.getFileName(body.location)
         source = self._sources.get(filepath)
         if source is None:
+            # Normally populated by scan_dir; strip on the fallback path too so
+            # the write-back always starts from pristine source.
             try:
-                source = Path(filepath).read_text(errors='replace')
+                source = _strip_all_aw_content(Path(filepath).read_text(errors='replace'))
             except Exception:
                 source = ''
             self._sources[filepath] = source
@@ -942,14 +956,30 @@ def _add_port_decls_to_body(source: str, mod_name: str,
     additions = '\n' + ''.join(decl_lines)
     return source[:insert_pos] + additions + source[insert_pos:]
 
-def _replace_auto_block(source: str, block: str) -> str:
-    """Replace existing AUTO_WIRE_BEGIN/END region, or insert before endmodule."""
+def _replace_auto_block(source: str, block: str, mod_name: str = '',
+                        inst_names=()) -> str:
+    """Replace an existing AUTO_WIRE_BEGIN/END region in place; otherwise insert
+    the block just before the first instance instantiation. That position sits
+    after the module's port/signal declarations (so adapter assigns reference
+    declared signals) yet before the instances that consume the crossing wires
+    (so the wires are declared before use) — correct for both ANSI and non-ANSI
+    modules. With no instances, insert before endmodule."""
     # Search in masked text so embedded MARK_BEGIN in inline stamps don't confuse us
     masked = _mask_comments(source)
     bi = masked.find(MARK_BEGIN)
     ei = masked.find(MARK_END)
     if bi >= 0 and ei >= 0:
         return source[:bi] + block + source[ei + len(MARK_END):]
+    # Earliest instance instantiation position.
+    first = None
+    for iname in inst_names:
+        m = re.search(r'\b' + re.escape(iname) + r'\s*\(', masked)
+        if m and (first is None or m.start() < first):
+            first = m.start()
+    if first is not None:
+        line_start = source.rfind('\n', 0, first) + 1
+        return source[:line_start] + block + '\n\n' + source[line_start:]
+    # No instances: insert before endmodule (after all declarations).
     em = source.rfind('endmodule')
     if em < 0:
         return source + '\n' + block + '\n'
@@ -980,15 +1010,20 @@ def _strip_all_aw_content(source: str) -> str:
 
     source = re.sub(
         r',[ \t]*' + aw_prefix + r'[^\n]*\n[ \t]*'
-        r'(?:(?:input|output|inout)\s+wire(?:\s*\[[^\]]*\])?\s+\w+'   # header port
+        r'(?:(?:input|output|inout)\s+wire(?:\s*\[[^\]]*\])?\s+\w+'   # ANSI typed header port
         r'|'
-        r'\.\w+[ \t]*\([^)]*\))',                                       # inst conn
+        r'\.\w+[ \t]*\([^)]*\)'                                         # instance connection
+        r'|'
+        r'\w+(?=\s*[,)]))',                                             # bare non-ANSI header port name
         '', source)
 
     # Also remove body-style inline-stamped declarations ending with semicolon,
-    # e.g. "// aw:user 2026-04-21\n    input wire [7:0] foo;"
+    # e.g. "// aw:user 2026-04-21\n    input wire [7:0] foo;". Consume the
+    # leading newline and each group's trailing newline so re-runs don't
+    # accumulate blank lines (these are inserted as one contiguous block).
     source = re.sub(
-        aw_prefix + r'[^\n]*\n[ \t]*(?:input|output|inout)\s+wire(?:\s*\[[^\]]*\])?\s+\w+\s*;',
+        r'\n(?:' + aw_prefix +
+        r'[^\n]*\n[ \t]*(?:input|output|inout)\s+wire(?:\s*\[[^\]]*\])?\s+\w+\s*;\n)+',
         '', source)
 
     return source
@@ -1008,9 +1043,10 @@ def apply_changes(mod: ModuleDef, mc: ModChanges, user: str) -> str:
         # Also add semicolon-terminated body-style declarations for legacy modules
         source = _add_port_decls_to_body(source, mod.name, mc.port_adds, user)
 
-    # 3. Insert AUTO_WIRE_BEGIN … AUTO_WIRE_END block before endmodule
+    # 3. Insert AUTO_WIRE_BEGIN … AUTO_WIRE_END block right after the header
     block  = _build_auto_block(mc, user)
-    source = _replace_auto_block(source, block)
+    source = _replace_auto_block(source, block, mod.name,
+                                 list(mod.instances.keys()))
 
     return source
 
@@ -1307,7 +1343,9 @@ ENDPOINT FORMAT
                 continue
             new_src = apply_changes(mod, mc, user)
             if new_src != mod.source:
-                Path(mod.filepath).write_text(new_src)
+                # Write UTF-8 with explicit LF so re-runs don't churn line
+                # endings (source is read with universal newlines → '\n').
+                Path(mod.filepath).write_text(new_src, encoding='utf-8', newline='\n')
                 print(col(f'  ✓  {mod.filepath}', C.GREEN))
                 written += 1
             else:
