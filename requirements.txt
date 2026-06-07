@@ -1,0 +1,5 @@
+# AutoWire runtime dependencies
+pyslang>=11.0.0
+
+# Optional — only needed when the connection list is an .xlsx/.xls file:
+# openpyxl>=3.0

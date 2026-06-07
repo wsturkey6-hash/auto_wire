@@ -1,4 +1,9 @@
+# Generated artifact
 /autowire_warn.log
-/debug_parse.py
-/example_connections.csv
-/files.zip
+
+# Large vendored upstream archive — kept locally, not committed
+/test_rtl/i2c-master.zip
+
+# Python
+__pycache__/
+*.pyc

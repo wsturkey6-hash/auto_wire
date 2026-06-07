@@ -1,0 +1,24 @@
+# autowire_v3 connections file
+# Format: wire_name , src (HIER/PATH.port) , dst (HIER/PATH.port) , comment
+#
+# Leave wire_name blank to auto-generate from port names
+#
+# ─── Connection 1 ────────────────────────────────────────────────────────────
+# TOP/SUBSYS_A/porta  →  TOP/SUBSYS_B/SUBSYS_BB/porta
+# sa_result (16b) in SUBSYS_A  →  sbb_data (16b) in SUBSYS_BB  (no mismatch)
+wire_name,src,dst,comment
+w_sa_result_to_bb,TOP/u_subsys_a.sa_result,TOP/u_subsys_b/u_subsys_bb.sbb_data,SUBSYS_A result to SUBSYS_BB data
+
+# ─── Connection 2 ────────────────────────────────────────────────────────────
+# TOP/SUBSYS_C/portb  →  TOP/SUBSYS_D/SUBSYS_DD/SUBSYS_DDD/portb
+# sc_sensor_bus (32b) in SUBSYS_C  →  sddd_sensor_in (32b) in SUBSYS_DDD
+w_sensor_bus,TOP/u_subsys_c.sc_sensor_bus,TOP/u_subsys_d/u_subsys_dd/u_subsys_ddd.sddd_sensor_in,Sensor bus deep crossing
+
+# ─── Connection 3 ────────────────────────────────────────────────────────────
+# Auto-named: valid signal crossing
+,TOP/u_subsys_c.sc_sensor_vld,TOP/u_subsys_d/u_subsys_dd/u_subsys_ddd.sddd_sensor_vld,Sensor valid deep crossing
+
+# ─── Connection 4 ────────────────────────────────────────────────────────────
+# Width mismatch test: sa_result (16b) → sddd_sensor_in (32b)
+# Tool should zero-pad 16b → 32b
+w_result_padded,TOP/u_subsys_a.sa_result,TOP/u_subsys_d/u_subsys_dd/u_subsys_ddd.sddd_sensor_in,Width mismatch test 16b to 32b
