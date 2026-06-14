@@ -51,7 +51,8 @@ except ImportError:
 try:
     import pyslang
     from pyslang.syntax import SyntaxTree
-    from pyslang.ast import Compilation, DefinitionKind, ArgumentDirection
+    from pyslang.ast import (Compilation, CompilationOptions,
+                             DefinitionKind, ArgumentDirection)
     HAS_PYSLANG = True
 except ImportError:
     HAS_PYSLANG = False
@@ -167,11 +168,15 @@ class RTLDatabase:
         self._comp = None                    # pyslang Compilation
         self._sm   = None                    # pyslang SourceManager
         self._sources: Dict[str,str] = {}    # filepath -> source text (cached)
+        self.elab_error_count = 0            # pyslang elaboration error count
+        self.elab_error_text  = ''           # rendered elaboration diagnostics
 
     # ── Scanning ──────────────────────────────────────────────────────────────
-    def scan_dir(self, rtl_dir: str):
+    def scan_dir(self, rtl_dir: str, top: Optional[str] = None):
         """Parse every *.v under rtl_dir into one pyslang Compilation. Concrete
-        module/hierarchy extraction happens in build_hierarchy (needs elaboration)."""
+        module/hierarchy extraction happens in build_hierarchy (needs elaboration).
+        When `top` is given, elaboration is constrained to that module so a large
+        tree of incidental top-level modules (testbenches, unused) isn't built."""
         files = sorted(Path(rtl_dir).rglob('*.v'))
         if not files:
             return 0
@@ -180,7 +185,14 @@ class RTLDatabase:
         # `include "..."` resolves wherever the header lives.
         for d in sorted({str(f.parent) for f in files}):
             self._sm.addUserDirectories(d)
-        self._comp = Compilation()
+        if top:
+            opts = CompilationOptions()
+            opts.topModules = {top}
+            bag = pyslang.Bag()
+            bag.compilationOptions = opts
+            self._comp = Compilation(bag)
+        else:
+            self._comp = Compilation()
         for f in files:
             try:
                 raw = Path(f).read_text(errors='replace')
@@ -227,18 +239,68 @@ class RTLDatabase:
                 f'Root modules detected: {roots}')
             return
         self.root = self._build_node(top_inst, top)
+        self._collect_elab_errors()
+
+    def _collect_elab_errors(self):
+        """Count/render pyslang elaboration errors so a wrong hierarchy isn't
+        silent. Non-fatal — recorded for main() to warn about."""
+        try:
+            eng = pyslang.DiagnosticEngine(self._sm)
+            client = pyslang.TextDiagnosticClient()
+            eng.addClient(client)
+            for d in self._comp.getAllDiagnostics():
+                eng.issue(d)
+            n = eng.numErrors
+            n = n() if callable(n) else n
+            if n:
+                self.elab_error_count = int(n)
+                self.elab_error_text = client.getString()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _seg(sym) -> str:
+        """Path segment for a symbol: last '.'-component of its hierarchical
+        path, e.g. 'u_leaf', 'u_arr[0]', 'g_blk[1]'."""
+        hp = getattr(sym, 'hierarchicalPath', '') or ''
+        return hp.rsplit('.', 1)[-1] if hp else getattr(sym, 'name', '')
 
     def _build_node(self, inst_sym, path: str) -> HierNode:
         body = inst_sym.body
-        node = HierNode(body.name, inst_sym.name, path)
+        node = HierNode(body.name, path.rsplit('/', 1)[-1], path)
         if body.name not in self.modules:
             self.modules[body.name] = self._module_from_body(body)
-        for mem in body:
-            if type(mem).__name__ == 'InstanceSymbol':
-                child = self._build_node(mem, f'{path}/{mem.name}')
-                child.parent = node
-                node.children.append(child)
+        self._add_children(body, node)
         return node
+
+    def _add_children(self, scope, parent: HierNode):
+        """Thread a scope's members into the tree, recursing through instance
+        arrays and generate blocks so nothing nested under them is dropped."""
+        for mem in scope:
+            k = type(mem).__name__
+            if k == 'InstanceSymbol':
+                child = self._build_node(mem, f'{parent.path}/{self._seg(mem)}')
+                child.parent = parent
+                parent.children.append(child)
+            elif k == 'InstanceArraySymbol':
+                for elem in mem.elements:
+                    if type(elem).__name__ != 'InstanceSymbol':
+                        continue
+                    child = self._build_node(elem, f'{parent.path}/{self._seg(elem)}')
+                    child.parent = parent
+                    parent.children.append(child)
+            elif k in ('GenerateBlockArraySymbol', 'GenerateBlockSymbol'):
+                # A generate block is a hierarchy level with no module of its own.
+                # An array iterates its per-iteration blocks; a solo block (true
+                # if-generate) is itself one level.
+                blocks = list(mem) if k == 'GenerateBlockArraySymbol' else [mem]
+                for blk in blocks:
+                    seg = self._seg(blk)
+                    gnode = HierNode('', seg, f'{parent.path}/{seg}')
+                    gnode.parent = parent
+                    parent.children.append(gnode)
+                    self._add_children(blk, gnode)
+        return parent
 
     # ── pyslang symbol → ModuleDef mapping ──────────────────────────────────────
     @staticmethod
@@ -1212,7 +1274,7 @@ ENDPOINT FORMAT
 
     # ── Scan RTL ──────────────────────────────────────────────────────────────
     db = RTLDatabase()
-    count = db.scan_dir(args.rtl_dir)
+    count = db.scan_dir(args.rtl_dir, args.top)
     print(col(f'\n  Modules   : {count} parsed', C.GREEN))
 
     if db.errors:
@@ -1231,6 +1293,13 @@ ENDPOINT FORMAT
         print(col('\n  HIERARCHY ERRORS:', C.RED, C.BOLD))
         for e in db.errors: print(col(f'  {e}', C.RED))
         sys.exit(1)
+
+    if db.elab_error_count:
+        print(col(f'\n  ⚠  {db.elab_error_count} elaboration error(s) reported by '
+                  f'pyslang — the hierarchy may be incomplete/incorrect:',
+                  C.YELLOW, C.BOLD))
+        for line in db.elab_error_text.splitlines()[:10]:
+            print(col(f'    {line}', C.DIM))
 
     if args.tree:
         print(col('\n  Hierarchy tree:', C.BOLD))
@@ -1262,6 +1331,15 @@ ENDPOINT FORMAT
     for spec in conns:
         for side, path, port in [('src', spec.src_path, spec.src_port),
                                   ('dst', spec.dst_path, spec.dst_port)]:
+            # An '[' in any segment means the path crosses an instance array or
+            # generate block. The hierarchy/--tree handle these, but write-back
+            # can't edit a single instantiation that stands for N instances.
+            if '[' in path:
+                validation_errors.append(
+                    f'  Row {spec.row_num}: {side} path "{path}" is inside an '
+                    f'instance array or generate block; write-back there is not '
+                    f'supported.')
+                continue
             n = db.node(path)
             if n is None:
                 validation_errors.append(
