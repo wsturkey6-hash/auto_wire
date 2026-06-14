@@ -197,6 +197,71 @@ class NonAnsiE2ETests(_E2EBase, unittest.TestCase):
     make_fixture = staticmethod(write_fixture_nonansi)
 
 
+# ── instance arrays + generate blocks ────────────────────────────────────────
+def write_fixture_arraygen(d: Path):
+    """A design using an instance array and a generate-for loop, plus one plain
+    instance, to exercise hierarchy completeness and the write-back guard."""
+    (d / "leaf.v").write_text(textwrap.dedent("""\
+        module leaf (input clk, input [7:0] d);
+        endmodule
+    """), newline="\n")
+    (d / "top.v").write_text(textwrap.dedent("""\
+        module top (input clk, input [7:0] data_in);
+            leaf u_arr [1:0] (.clk(clk));
+            genvar i;
+            generate for (i=0;i<2;i=i+1) begin : g_blk
+                leaf u_gen (.clk(clk));
+            end endgenerate
+            leaf u_plain (.clk(clk));
+        endmodule
+    """), newline="\n")
+
+
+class ArrayGenTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.rtl = Path(self.tmp)
+        write_fixture_arraygen(self.rtl)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _csv(self, dst):
+        p = self.rtl / "conn.csv"
+        p.write_text("wire_name,bit_width,src,dst,comment\n"
+                     f"w_data,8,top.data_in,{dst},x\n", newline="\n")
+        return p
+
+    def test_hierarchy_includes_array_and_generate(self):
+        db = aw.RTLDatabase()
+        db.scan_dir(self.rtl, "top")
+        db.build_hierarchy("top")
+        self.assertEqual(db.errors, [])
+        self.assertIsNotNone(db.node("top/u_arr[1]"))
+        self.assertIsNotNone(db.node("top/g_blk[0]/u_gen"))
+        self.assertIsNotNone(db.node("top/u_plain"))
+
+    def test_plain_endpoint_still_wires(self):
+        r = run_tool(self.rtl, self._csv("top/u_plain.d"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("assign w_data = data_in", read_all(self.rtl)["top.v"])
+        self.assertEqual(elaboration_errors(self.rtl), 0)
+        # idempotent
+        first = read_all(self.rtl)
+        self.assertEqual(run_tool(self.rtl, self._csv("top/u_plain.d")).returncode, 0)
+        self.assertEqual(first, read_all(self.rtl))
+
+    def test_array_endpoint_refused(self):
+        r = run_tool(self.rtl, self._csv("top/u_arr[0].d"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("instance array or generate block", (r.stdout + r.stderr))
+
+    def test_generate_endpoint_refused(self):
+        r = run_tool(self.rtl, self._csv("top/g_blk[0]/u_gen.d"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("instance array or generate block", (r.stdout + r.stderr))
+
+
 # ── optional external-linter cross-check ─────────────────────────────────────
 class LintTests(unittest.TestCase):
     LINTER = shutil.which("iverilog") or shutil.which("verilator")
