@@ -5,7 +5,8 @@ Run with:  python -m unittest discover -s tests   (from the repo root)
 Covers unit-level helpers, an end-to-end wiring run on a hermetic synthetic
 fixture (assertions on the generated RTL), idempotency (a second run is
 byte-identical), pyslang elaboration of the result, the missing-source fatal
-path, and an optional external linter cross-check (skipped if none installed).
+path, the pyslang import-failure messages, and an optional external linter
+cross-check (skipped if none installed).
 """
 import os
 import sys
@@ -260,6 +261,33 @@ class ArrayGenTests(unittest.TestCase):
         r = run_tool(self.rtl, self._csv("top/g_blk[0]/u_gen.d"))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("instance array or generate block", (r.stdout + r.stderr))
+
+
+# ── pyslang import failure ───────────────────────────────────────────────────
+class PyslangImportTests(unittest.TestCase):
+    def _run(self, *pyflags, env=None):
+        return subprocess.run(
+            [sys.executable, *pyflags, AUTOWIRE,
+             "-d", ".", "-T", "top", "-c", "x.csv"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=env,
+        )
+
+    def test_unloadable_pyslang_reports_real_cause(self):
+        # installed but unloadable (e.g. DLL blocked): reinstalling won't help
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "pyslang").mkdir()
+            (Path(d) / "pyslang" / "__init__.py").write_text(
+                'raise ImportError("DLL load failed (simulated)")\n')
+            r = self._run(env=dict(os.environ, PYTHONPATH=d))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("DLL load failed (simulated)", r.stderr)
+        self.assertNotIn("pip install", r.stderr)
+
+    def test_missing_pyslang_suggests_install(self):
+        r = self._run("-S", "-E")  # no site-packages: pyslang truly absent
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("pip install pyslang", r.stderr)
 
 
 # ── optional external-linter cross-check ─────────────────────────────────────

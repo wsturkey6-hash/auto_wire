@@ -54,8 +54,9 @@ try:
     from pyslang.ast import (Compilation, CompilationOptions,
                              DefinitionKind, ArgumentDirection)
     HAS_PYSLANG = True
-except ImportError:
+except ImportError as e:
     HAS_PYSLANG = False
+    PYSLANG_IMPORT_ERROR = e
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ANSI Colors
@@ -1222,8 +1223,13 @@ def main():
         pass
 
     if not HAS_PYSLANG:
-        sys.exit('ERROR: pyslang is required for RTL parsing. '
-                 'Install it with:  pip install pyslang')
+        err = PYSLANG_IMPORT_ERROR
+        if isinstance(err, ModuleNotFoundError) and err.name == 'pyslang':
+            sys.exit('ERROR: pyslang is required for RTL parsing. '
+                     'Install it with:  pip install pyslang')
+        # Installed but unloadable (e.g. its DLL blocked by Windows Smart App
+        # Control): reinstalling won't help, so report the real cause.
+        sys.exit(f'ERROR: pyslang is installed but failed to load: {err}')
 
     ap = argparse.ArgumentParser(
         description='AutoWire v3: CSV-driven SoC point-to-point wiring',
