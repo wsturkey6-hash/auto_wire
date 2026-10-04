@@ -35,7 +35,7 @@ autowire_v3.py  ─  SoC Integration Auto-Wiring Tool  v3.0
   python3 autowire_v3.py --rtl-dir ./rtl --top TOP --csv conn.csv --no-color
 """
 
-import re, os, sys, csv, json, argparse, getpass, locale
+import re, os, sys, csv, argparse, getpass, locale
 from datetime import date as dt_date
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -98,6 +98,7 @@ class ModuleDef:
     wires:     Dict[str,SigInfo] = field(default_factory=dict)
     instances: Dict[str,InstInfo]= field(default_factory=dict)
     source:    str = ''
+    names:     set = field(default_factory=set)  # every name declared in scope
 
 @dataclass
 class ConnSpec:
@@ -150,12 +151,13 @@ def _width_str(w: int) -> str:
     """Render a concrete bit width as a Verilog range, e.g. 8 -> '[7:0]'."""
     return f'[{w-1}:0]' if w and w > 1 else ''
 
-def _read_rtl(path) -> Tuple[str, str, bool]:
-    """Decode an RTL file without losing anything. Returns (text with '\\n'
-    line endings, encoding, had_crlf). Tries UTF-8 (BOM-aware), then the
-    system locale encoding (e.g. cp950 for Big5 files), then latin-1; a
-    candidate is accepted only if it re-encodes to the exact original bytes,
-    so everything the tool doesn't edit is written back byte-for-byte."""
+def _read_rtl(path) -> Tuple[str, str, str]:
+    """Decode a text file (RTL, or the connections CSV) without losing
+    anything. Returns (text with '\\n' line endings, encoding, text as read).
+    Tries UTF-8 (BOM-aware), then the system locale encoding (e.g. cp950 for
+    Big5 files), then latin-1; a candidate is accepted only if it re-encodes
+    to the exact original bytes, so everything the tool doesn't edit is
+    written back byte-for-byte."""
     data = Path(path).read_bytes()
     getenc = getattr(locale, 'getencoding', None) or locale.getpreferredencoding
     for enc in ('utf-8-sig' if data.startswith(b'\xef\xbb\xbf') else 'utf-8',
@@ -166,7 +168,37 @@ def _read_rtl(path) -> Tuple[str, str, bool]:
                 break
         except (UnicodeError, LookupError):
             continue
-    return text.replace('\r\n', '\n'), enc, '\r\n' in text
+    return text.replace('\r\n', '\n'), enc, text
+
+_LINE_RE = re.compile(r'[^\n]*\n|[^\n]+\Z')
+
+def _restore_eols(orig: str, new: str) -> str:
+    """Give new text ('\\n' line endings) the line endings of the file as read.
+    A file with one style gets it throughout; in a mixed file, lines the edit
+    left alone keep their own ending and new or changed lines take the most
+    common one, so only edited lines change."""
+    o = _LINE_RE.findall(orig)
+    nl   = sum(l.endswith('\n') for l in o)
+    crlf = sum(l.endswith('\r\n') for l in o)
+    if crlf == 0:
+        return new
+    if crlf == nl:
+        return new.replace('\n', '\r\n')
+    eol = '\r\n' if 2 * crlf > nl else '\n'
+    o_body = [l[:-2] if l.endswith('\r\n') else l.rstrip('\n') for l in o]
+    n = _LINE_RE.findall(new)
+    out = []
+    matcher = SequenceMatcher(None, o_body, [l.rstrip('\n') for l in n], autojunk=False)
+    for tag, i1, _, j1, j2 in matcher.get_opcodes():
+        for k in range(j2 - j1):
+            line = n[j1 + k]
+            if not line.endswith('\n'):
+                out.append(line)                     # final line, no newline
+            elif tag == 'equal' and o[i1 + k].endswith('\n'):
+                out.append(o[i1 + k])                # untouched: its own ending
+            else:
+                out.append(line[:-1] + eol)
+    return ''.join(out)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RTL DATABASE + HIERARCHY TREE
@@ -187,7 +219,7 @@ class RTLDatabase:
         self._comp = None                    # pyslang Compilation
         self._sm   = None                    # pyslang SourceManager
         self._sources: Dict[str,str] = {}    # filepath -> source text (cached)
-        self._encodings: Dict[str,Tuple[str,bool]] = {}  # filepath -> (encoding, crlf)
+        self._encodings: Dict[str,Tuple[str,str]] = {}  # filepath -> (encoding, text as read)
         self._stale: set = set()             # files still holding tool output
         self._canon: Dict[str,str] = {}      # normalized abs path -> scan key
         self.elab_error_count = 0            # pyslang elaboration error count
@@ -195,17 +227,20 @@ class RTLDatabase:
 
     # ── Scanning ──────────────────────────────────────────────────────────────
     def scan_dir(self, rtl_dir: str, top: Optional[str] = None):
-        """Parse every *.v under rtl_dir into one pyslang Compilation. Concrete
-        module/hierarchy extraction happens in build_hierarchy (needs elaboration).
-        When `top` is given, elaboration is constrained to that module so a large
-        tree of incidental top-level modules (testbenches, unused) isn't built."""
-        files = sorted(Path(rtl_dir).rglob('*.v'))
+        """Parse every *.v / *.sv under rtl_dir into one pyslang Compilation.
+        Concrete module/hierarchy extraction happens in build_hierarchy (needs
+        elaboration). When `top` is given, elaboration is constrained to that
+        module so a large tree of incidental top-level modules (testbenches,
+        unused) isn't built. Every file's pristine text is registered before
+        anything is parsed, so an `include of a scanned file sees it without
+        the tool's earlier output."""
+        files = sorted({*Path(rtl_dir).rglob('*.v'), *Path(rtl_dir).rglob('*.sv')})
         if not files:
             return 0
         self._sm = pyslang.SourceManager()
         # Make every directory that contains RTL an include search path so
         # `include "..."` resolves wherever the header lives.
-        for d in sorted({str(f.parent) for f in files}):
+        for d in sorted({os.path.abspath(f.parent) for f in files}):
             self._sm.addUserDirectories(d)
         if top:
             opts = CompilationOptions()
@@ -217,7 +252,7 @@ class RTLDatabase:
             self._comp = Compilation()
         for f in files:
             try:
-                raw, enc, crlf = _read_rtl(f)
+                raw, enc, orig = _read_rtl(f)
             except Exception as e:
                 self.errors.append(f'read error in {f}: {e}')
                 continue
@@ -227,15 +262,27 @@ class RTLDatabase:
             # write-back edits, keyed by the file path.
             clean = _strip_all_aw_content(raw)
             self._sources[str(f)] = clean
-            self._encodings[str(f)] = (enc, crlf)
+            self._encodings[str(f)] = (enc, orig)
             self._canon[os.path.normcase(os.path.abspath(f))] = str(f)
             if clean != raw:
                 self._stale.add(str(f))
+        # Register every file's pristine text under its absolute path before
+        # parsing anything: an `include of a scanned file then resolves to that
+        # text (not the file on disk, which may hold earlier tool output), and
+        # no file is ever loaded twice. Each file is still compiled as its own
+        # unit; slang ignores a definition it meets again at the same source
+        # location through an include.
+        buffers = {}
+        for fp, clean in self._sources.items():
             try:
-                self._comp.addSyntaxTree(
-                    SyntaxTree.fromText(clean, self._sm, str(f), str(f)))
+                buffers[fp] = self._sm.assignText(os.path.abspath(fp), clean)
             except Exception as e:
-                self.errors.append(f'parse error in {f}: {e}')
+                self.errors.append(f'parse error in {fp}: {e}')
+        for fp, buf in buffers.items():
+            try:
+                self._comp.addSyntaxTree(SyntaxTree.fromBuffer(buf, self._sm))
+            except Exception as e:
+                self.errors.append(f'parse error in {fp}: {e}')
         try:
             defs = self._comp.getDefinitions()
             return sum(1 for d in defs if d.definitionKind == DefinitionKind.Module)
@@ -245,24 +292,42 @@ class RTLDatabase:
     def encode_source(self, filepath: str, text: str) -> bytes:
         """Encode text for writing back in the file's own encoding and line
         endings, as detected by _read_rtl when it was scanned."""
-        enc, crlf = self._encodings.get(filepath, ('utf-8', False))
-        if crlf:
-            text = text.replace('\n', '\r\n')
-        return text.encode(enc)
+        enc, orig = self._encodings.get(filepath, ('utf-8', ''))
+        return _restore_eols(orig, text).encode(enc)
+
+    def same_but_stamps(self, filepath: str, data: bytes) -> bool:
+        """True when data matches the file on disk, ignoring the user/date
+        stamps, so a re-run by someone else or on another day writes nothing."""
+        try:
+            disk = Path(filepath).read_bytes()
+        except OSError:
+            return False
+        if disk == data:
+            return True
+        enc = self._encodings.get(filepath, ('utf-8', ''))[0]
+        try:
+            return _blank_stamps(disk.decode(enc)) == _blank_stamps(data.decode(enc))
+        except UnicodeDecodeError:
+            return False
 
     def stale_sources(self) -> Dict[str, str]:
         """Pristine text of each scanned file that still holds tool output."""
         return {fp: self._sources[fp] for fp in sorted(self._stale)}
 
-    def check_duplicates(self) -> List[str]:
-        # pyslang elaboration is authoritative for real conflicts; the old
-        # port-vs-reg heuristic produced false positives and is no longer needed.
-        return []
+    def instances_of(self, module_name: str) -> List[str]:
+        """Hierarchy paths of every instance of module_name."""
+        found, todo = [], ([self.root] if self.root else [])
+        while todo:
+            n = todo.pop()
+            if n.module_name == module_name:
+                found.append(n.path)
+            todo.extend(n.children)
+        return sorted(found)
 
     # ── Hierarchy ─────────────────────────────────────────────────────────────
     def build_hierarchy(self, top: str):
         if self._comp is None:
-            self.errors.append('No RTL parsed (scan_dir not run, or no .v files)')
+            self.errors.append('No RTL parsed (scan_dir not run, or no .v/.sv files)')
             return
         try:
             root_sym = self._comp.getRoot()
@@ -357,9 +422,9 @@ class RTLDatabase:
             # Normally populated by scan_dir; strip on the fallback path too so
             # the write-back always starts from pristine source.
             try:
-                raw, enc, crlf = _read_rtl(filepath)
+                raw, enc, orig = _read_rtl(filepath)
                 source = _strip_all_aw_content(raw)
-                self._encodings[filepath] = (enc, crlf)
+                self._encodings[filepath] = (enc, orig)
                 if source != raw:
                     self._stale.add(filepath)
             except Exception:
@@ -393,14 +458,20 @@ class RTLDatabase:
                         if expr is not None and expr.syntax is None:
                             # An output port binds as an implicit assignment;
                             # the connected net is its left-hand side.
-                            expr = getattr(expr, 'left', None)
-                        conns[pc.port.name] = (str(expr.syntax).strip()
-                                               if expr is not None and expr.syntax is not None
-                                               else '')
+                            left = getattr(expr, 'left', None)
+                            expr = left if left is not None else expr
+                        if expr is None:
+                            conns[pc.port.name] = ''
+                        elif expr.syntax is None:
+                            # SV implicit `.name` / `.*`: the same-named signal
+                            conns[pc.port.name] = pc.port.name
+                        else:
+                            conns[pc.port.name] = str(expr.syntax).strip()
                     except Exception:
                         conns[pc.port.name] = ''
                 instances[m.name] = InstInfo(m.name, m.body.name, conns)
-        return ModuleDef(body.name, filepath, ports, wires, instances, source)
+        names = {m.name for m in members if getattr(m, 'name', '')}
+        return ModuleDef(body.name, filepath, ports, wires, instances, source, names)
 
     def node(self, path: str) -> Optional[HierNode]:
         if not self.root: return None
@@ -458,8 +529,9 @@ def _parse_endpoint(raw: str, row_num: int) -> Tuple[str, str]:
 
 def parse_connections_csv(filepath: str) -> List[ConnSpec]:
     conns: List[ConnSpec] = []
-    with open(filepath, newline='', errors='replace') as f:
-        lines = f.readlines()
+    # Decoded like the RTL: UTF-8 with or without a BOM (Excel's "CSV UTF-8"),
+    # else the system encoding.
+    lines = _read_rtl(filepath)[0].split('\n')
 
     reader_lines = []
     for line in lines:
@@ -890,7 +962,7 @@ def plan_conflicts(db: RTLDatabase, row: ChangeSet, done: ChangeSet,
     ours = (spec.wire_name, f'w_adapt_{spec.wire_name}')
     for mn, mc in row.all_modules().items():
         mod  = db.modules.get(mn)
-        have = (set(mod.ports) | set(mod.wires)) if mod else set()
+        have = (mod.names | set(mod.ports) | set(mod.wires)) if mod else set()
         kinds: Dict[str, set] = {}
         for m in (done.all_modules().get(mn), mc):
             for p, d, w in (m.port_adds if m else []):
@@ -933,6 +1005,13 @@ _INLINE_STAMP_PREFIX = '// aw:'
 # Marker left after a connection the tool rewrote in place; it holds the
 # original `.port(...)` text so _strip_all_aw_content can restore it.
 _ORIG_OPEN, _ORIG_CLOSE = '/*aw-orig:', '*/'
+
+_STAMP_RE = re.compile('(' + re.escape(MARK_BEGIN) + '|'
+                       + re.escape(_INLINE_STAMP_PREFIX) + r')[^\r\n]*')
+
+def _blank_stamps(text: str) -> str:
+    """text with the user/date part of every stamp removed, for comparing runs."""
+    return _STAMP_RE.sub(r'\1', text)
 
 def _inline_stamp(user: str) -> str:
     return f'{_INLINE_STAMP_PREFIX}{user} {dt_date.today()}'
@@ -1084,7 +1163,8 @@ def _insert_inst_connections(source: str, inst_name: str,
     # for later idempotent removal). A replaced entry keeps its original
     # text in an aw-orig marker so the strip can restore it.
     conn_text = source[open_pos+1:close_pos]
-    conn_re = re.compile(r'\.\s*(\w+)\s*\(\s*([^)]*?)\s*\)', re.MULTILINE)
+    # `.port(sig)`, or an SV implicit `.port` with no parentheses
+    conn_re = re.compile(r'\.\s*(\w+)(?:\s*\(\s*([^)]*?)\s*\))?', re.MULTILINE)
 
     existing_ports = set(m.group(1) for m in conn_re.finditer(conn_text))
 
@@ -1174,18 +1254,13 @@ def _add_port_decls_to_body(source: str, mod_name: str,
 
 def _replace_auto_block(source: str, block: str, mod_name: str = '',
                         inst_names=()) -> str:
-    """Replace an existing AUTO_WIRE_BEGIN/END region in place; otherwise insert
-    the block just before the first instance instantiation. That position sits
-    after the module's port/signal declarations (so adapter assigns reference
-    declared signals) yet before the instances that consume the crossing wires
-    (so the wires are declared before use) — correct for both ANSI and non-ANSI
-    modules. With no instances, insert before endmodule."""
-    # Search in masked text so embedded MARK_BEGIN in inline stamps don't confuse us
+    """Insert the block just before the first instance instantiation (source
+    is pristine, so there is never an earlier block to replace). That position
+    sits after the module's port/signal declarations (so adapter assigns
+    reference declared signals) yet before the instances that consume the
+    crossing wires (so the wires are declared before use) — correct for both
+    ANSI and non-ANSI modules. With no instances, insert before endmodule."""
     masked = _mask_comments(source)
-    bi = masked.find(MARK_BEGIN)
-    ei = masked.find(MARK_END)
-    if bi >= 0 and ei >= 0:
-        return source[:bi] + block + source[ei + len(MARK_END):]
     # Earliest instantiation statement; inserting at the start of its first
     # line never splits a multi-line `Type #( ... ) inst (` statement.
     first = None
@@ -1205,14 +1280,16 @@ def _replace_auto_block(source: str, block: str, mod_name: str = '',
 def _strip_all_aw_content(source: str) -> str:
     """
     Remove ALL content previously written by this tool in one pass:
-      1. The AUTO_WIRE_BEGIN … AUTO_WIRE_END block (and surrounding blank lines)
+      1. The AUTO_WIRE_BEGIN … AUTO_WIRE_END block
       2. Every inline-stamped port/connection line (,  // aw:… \n    …)
     Returns the source as close to its original human-written form as possible.
     """
     # ── 1. Remove AUTO_WIRE_BEGIN … AUTO_WIRE_END block ──────────────────────
-    # Strip the block plus any preceding blank lines
+    # The block is inserted at a line start followed by a blank line, so
+    # removing it with the newlines after it (never the ones before) is the
+    # exact inverse and keeps the user's blank lines.
     source = re.sub(
-        r'\n*' + re.escape(MARK_BEGIN) + r'.*?' + re.escape(MARK_END) + r'\n?',
+        re.escape(MARK_BEGIN) + r'.*?' + re.escape(MARK_END) + r'\n{0,2}',
         '', source, flags=re.DOTALL)
 
     # ── 2. Remove inline-stamped entries ─────────────────────────────────────
@@ -1452,8 +1529,8 @@ ENDPOINT FORMAT
                     help='Root directory of RTL project (scanned recursively)')
     ap.add_argument('--top',     '-T', required=True,
                     help='Top-level module name')
-    ap.add_argument('--csv',     '-c', required=True,
-                    help='Connections CSV (or XLSX) file')
+    ap.add_argument('--csv',     '-c', default=None,
+                    help='Connections CSV (or XLSX) file (not needed with --tree)')
     ap.add_argument('--sheet',   '-s', default=0,
                     help='Excel sheet name or 0-based index (XLSX only)')
     ap.add_argument('--out-log', '-l', default=None,
@@ -1466,6 +1543,8 @@ ENDPOINT FORMAT
                     help='Disable ANSI color output')
 
     args = ap.parse_args()
+    if not args.csv and not args.tree:
+        ap.error('the following arguments are required: --csv/-c')
 
     global USE_COLOR
     if args.no_color or not sys.stdout.isatty():
@@ -1478,7 +1557,7 @@ ENDPOINT FORMAT
     print(f'\n  User      : {col(user,    C.WHITE, C.BOLD)}')
     print(f'  Top       : {col(args.top, C.CYAN,  C.BOLD)}')
     print(f'  RTL dir   : {col(args.rtl_dir, C.DIM)}')
-    print(f'  CSV       : {col(args.csv,     C.DIM)}')
+    print(f'  CSV       : {col(args.csv or "-", C.DIM)}')
 
     # ── Scan RTL ──────────────────────────────────────────────────────────────
     db = RTLDatabase()
@@ -1488,12 +1567,6 @@ ENDPOINT FORMAT
     if db.errors:
         print(col('\n  ERRORS:', C.RED, C.BOLD))
         for e in db.errors: print(col(f'  {e}', C.RED))
-        sys.exit(1)
-
-    dup_errs = db.check_duplicates()
-    if dup_errs:
-        print(col('\n  DUPLICATE SIGNAL ERRORS (fix RTL before proceeding):', C.RED, C.BOLD))
-        for e in dup_errs: print(col(f'  {e}', C.RED))
         sys.exit(1)
 
     db.build_hierarchy(args.top)
@@ -1560,11 +1633,9 @@ ENDPOINT FORMAT
                         f'module "{n.module_name}". A source signal must already '
                         f'exist (add it to the RTL first).')
                 else:
-                    # Soft warning, not fatal: the tool creates missing dst
-                    # ports, or it may be on an IP not in rtl-dir.
-                    print(col(f'  WARN row {spec.row_num}: '
-                               f'{side} port "{port}" not found in module '
-                               f'"{n.module_name}" (may be external IP)', C.YELLOW))
+                    # Not a problem: the tool creates missing dst ports.
+                    print(col(f'  NOTE row {spec.row_num}: dst port "{port}" will be '
+                              f'added to module "{n.module_name}"', C.DIM))
 
     # ── Validate destinations ─────────────────────────────────────────────────
     seen_dst: Dict[Tuple[str, str], int] = {}
@@ -1606,7 +1677,16 @@ ENDPOINT FORMAT
             parent = db.module_at(parent_path)
             inst   = parent.instances.get(inst_name) if parent else None
             conn   = inst.connections.get(spec.dst_port) if inst else ''
-            if conn:
+            users  = db.instances_of(parent.name) if conn else []
+            if len(users) > 1:
+                # The edit goes into the module definition, so every instance
+                # of it would lose that connection.
+                validation_errors.append(
+                    f'  Row {r}: {where} is already connected to "{conn}" inside '
+                    f'module "{parent.name}", which is instantiated {len(users)} '
+                    f'times ({", ".join(users)}); rewiring it would change every '
+                    f'instance.')
+            elif conn:
                 print(col(f'  WARN row {r}: {where} is already connected to '
                           f'"{conn}"; that connection will be replaced', C.YELLOW))
 
@@ -1695,7 +1775,7 @@ ENDPOINT FORMAT
         # ── Apply changes ─────────────────────────────────────────────────────
         written = 0
         for fp, data in outputs.items():
-            if Path(fp).read_bytes() != data:
+            if not db.same_but_stamps(fp, data):
                 Path(fp).write_bytes(data)
                 print(col(f'  ✓  {fp}', C.GREEN))
                 written += 1
@@ -1705,6 +1785,8 @@ ENDPOINT FORMAT
         print(col(f'\n  {written} file(s) written.', C.GREEN if written else C.DIM))
     else:
         print(col('\n  [DRY RUN]  No files written.', C.YELLOW))
+        print()
+        return
 
     # ── Write warning log ─────────────────────────────────────────────────────
     warn_content = generate_warn_log(conns, mismatches, user)

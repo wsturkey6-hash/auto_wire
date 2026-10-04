@@ -82,9 +82,11 @@ def write_fixture_nonansi(d: Path):
 def run_tool(rtldir, csvpath, top="top", extra=(), answer="y\n", cwd=None):
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    # Keep the warning log next to the fixture instead of the caller's cwd.
     return subprocess.run(
         [sys.executable, AUTOWIRE, "-d", str(rtldir), "-T", top,
-         "-c", str(csvpath), "--no-color", *extra],
+         "-c", str(csvpath), "--no-color",
+         "--out-log", str(Path(rtldir) / "autowire_warn.log"), *extra],
         input=answer, capture_output=True, text=True,
         encoding="utf-8", errors="replace", env=env, cwd=cwd,
     )
@@ -103,7 +105,8 @@ def elaboration_errors(rtldir):
     sm = pyslang.SourceManager()
     sm.addUserDirectories(str(rtldir))
     comp = Compilation()
-    for f in sorted(glob.glob(os.path.join(str(rtldir), "*.v"))):
+    for f in sorted(glob.glob(os.path.join(str(rtldir), "*.v"))
+                    + glob.glob(os.path.join(str(rtldir), "*.sv"))):
         comp.addSyntaxTree(SyntaxTree.fromFile(f, sm))
     comp.getRoot()
     eng = pyslang.DiagnosticEngine(sm)
@@ -606,6 +609,16 @@ class EncodingTests(_TmpRTL):
         data = self._run(newline="\r\n")
         self.assertEqual(data.count(b"\n"), data.count(b"\r\n"))
 
+    def test_mixed_eol_untouched_lines_keep_endings(self):
+        write_fixture(self.rtl)
+        leaf = b"module leaf (\r\n    input clk\n);\r\n// note\nendmodule\r\n"
+        (self.rtl / "leaf.v").write_bytes(leaf)
+        csv = write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x")
+        self.assertEqual(run_tool(self.rtl, csv).returncode, 0)
+        self.assertIn(b"sink_in", (self.rtl / "leaf.v").read_bytes())
+        self.assertEqual(run_tool(self.rtl, write_csv(self.rtl)).returncode, 0)
+        self.assertEqual((self.rtl / "leaf.v").read_bytes(), leaf)
+
 
 # ── regression cases from the 2026-10 review (items 7–13) ────────────────────
 LEAF_Q = """\
@@ -680,6 +693,25 @@ class NameConflictTests(_TmpRTL):
             """})
         self.assertRejected(write_csv(self.rtl, "w_x,8,top/u_a/u_leaf.q,top/u_b/u_leaf.d,x"),
                             "conflicting")
+
+    def test_wire_name_equals_parameter(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {"top.v": """\
+            module top (
+                input        clk,
+                input  [7:0] data_in
+            );
+                localparam w_p = 1;
+                mid u_mid (.clk(clk));
+            endmodule
+        """})
+        self.assertRejected(write_csv(self.rtl, "w_p,8,top.data_in,top/u_mid/u_leaf.sink_in,x"),
+                            "already exists")
+
+    def test_wire_name_equals_instance(self):
+        write_fixture(self.rtl)
+        self.assertRejected(write_csv(self.rtl, "u_mid,8,top.data_in,top/u_mid/u_leaf.sink_in,x"),
+                            "already exists")
 
     def test_fan_out_from_unconnected_output(self):
         write_files(self.rtl, {
@@ -766,6 +798,27 @@ class DestinationTests(_TmpRTL):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("already connected", r.stdout)
         self.assertClean()
+
+    def test_rewire_in_shared_module_rejected(self):
+        # mid is instantiated twice: rewiring u_leaf.d inside it would change both.
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (input clk, input [7:0] d);
+                endmodule
+            """,
+            "mid.v": """\
+                module mid (input clk, input [7:0] old);
+                    leaf u_leaf (.clk(clk), .d(old));
+                endmodule
+            """,
+            "top.v": """\
+                module top (input clk, input [7:0] data_in, input [7:0] other);
+                    mid u_mid (.clk(clk), .old(other));
+                    mid u_mid2 (.clk(clk), .old(other));
+                endmodule
+            """})
+        self.assertRejected(write_csv(self.rtl, "w_d,8,top.data_in,top/u_mid/u_leaf.d,x"),
+                            "instantiated 2 times")
 
     def test_duplicate_dst_rejected(self):
         write_fixture(self.rtl)
@@ -893,6 +946,37 @@ class ReconcileTests(_TmpRTL):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(first, self.snapshot(), "second run changed the files")
 
+    def test_cleanup_keeps_blank_lines(self):
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (
+                    input clk
+                );
+
+                endmodule
+            """,
+            "mid.v": """\
+                module mid (
+                    input clk
+                );
+
+                    leaf u_leaf (.clk(clk));
+                endmodule
+            """,
+            "top.v": """\
+                module top (
+                    input        clk,
+                    input  [7:0] data_in
+                );
+
+                    mid u_mid (.clk(clk));
+                endmodule
+            """})
+        original = self.snapshot()
+        self.assertEqual(run_tool(self.rtl, write_csv(self.rtl, self.ROW)).returncode, 0)
+        self.assertEqual(run_tool(self.rtl, write_csv(self.rtl)).returncode, 0)
+        self.assertEqual(original, self.snapshot())
+
     def test_empty_csv_on_clean_tree_is_noop(self):        # guard
         write_fixture(self.rtl)
         original = self.snapshot()
@@ -918,6 +1002,239 @@ class PromptTests(_TmpRTL):
         r = run_tool(self.rtl, write_csv(self.rtl, self.ROW), answer="yes\n")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("sink_in", read_all(self.rtl)["leaf.v"])
+
+
+# ── regression cases from the 2026-10 review (remaining items) ───────────────
+ROW_DOWN = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
+
+
+class StampTests(_TmpRTL):
+    """Re-running as another user or on another day rewrites nothing."""
+    def _as(self, user, csv):
+        names = {k: user for k in ("LOGNAME", "USER", "LNAME", "USERNAME")}
+        with mock.patch.dict(os.environ, names):
+            return run_tool(self.rtl, csv)
+
+    def test_other_user_rerun_writes_nothing(self):
+        write_fixture(self.rtl)
+        csv = write_csv(self.rtl, ROW_DOWN)
+        self.assertEqual(self._as("alice", csv).returncode, 0)
+        first = self.snapshot()
+        r = self._as("bob", csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("0 file(s) written", r.stdout)
+        self.assertEqual(first, self.snapshot())
+
+    def test_next_day_rerun_writes_nothing(self):
+        write_fixture(self.rtl)
+        csv = write_csv(self.rtl, ROW_DOWN)
+        self.assertEqual(run_tool(self.rtl, csv).returncode, 0)
+        first = self.snapshot()
+        wrapper = self.rtl / "tomorrow.py"
+        wrapper.write_text(textwrap.dedent(f"""\
+            import sys, datetime
+            sys.path.insert(0, {str(ROOT)!r})
+            import autowire_v3 as aw
+            class D(datetime.date):
+                @classmethod
+                def today(cls):
+                    return datetime.date.today() + datetime.timedelta(days=1)
+            aw.dt_date = D
+            sys.argv = ["autowire_v3.py"] + sys.argv[1:]
+            aw.main()
+        """), newline="\n")
+        r = subprocess.run(
+            [sys.executable, str(wrapper), "-d", str(self.rtl), "-T", "top",
+             "-c", str(csv), "--no-color", "--out-log", str(self.rtl / "log.txt")],
+            input="y\n", capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(first, self.snapshot())
+
+
+class CsvTests(_TmpRTL):
+    """The connections CSV is decoded like the RTL (BOM, UTF-8, locale)."""
+    ROWS = ("wire_name,bit_width,src,dst,comment\n"
+            "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,中文說明\n")
+
+    def _run(self, data: bytes):
+        write_fixture(self.rtl)
+        csv = self.rtl / "conn.csv"
+        csv.write_bytes(data)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PYTHONUTF8", None)
+            r = run_tool(self.rtl, csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("sink_in", read_all(self.rtl)["leaf.v"])
+
+    def test_bom_csv_with_comment_first_line(self):
+        self._run(("# exported from Excel\n" + self.ROWS).encode("utf-8-sig"))
+
+    def test_cp950_csv(self):                              # guard
+        self._run(self.ROWS.encode("cp950"))
+
+
+class CliTests(_TmpRTL):
+    def test_dry_run_writes_nothing(self):
+        write_fixture(self.rtl)
+        original = self.snapshot()
+        r = run_tool(self.rtl, write_csv(self.rtl, ROW_DOWN), extra=("--dry-run",))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.rtl / "autowire_warn.log").exists())
+        self.assertEqual(original, self.snapshot())
+
+    def test_new_dst_port_is_a_note(self):
+        write_fixture(self.rtl)
+        r = run_tool(self.rtl, write_csv(self.rtl, ROW_DOWN))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("may be external IP", r.stdout)
+        self.assertIn("will be added", r.stdout)
+
+    def test_tree_without_csv(self):
+        write_fixture(self.rtl)
+        r = subprocess.run(
+            [sys.executable, AUTOWIRE, "-d", str(self.rtl), "-T", "top", "--tree",
+             "--no-color"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Hierarchy tree", r.stdout)
+
+
+class SvTests(_TmpRTL):
+    """SystemVerilog sources: *.sv files and implicit `.name` connections."""
+    def test_sv_file_is_scanned_and_edited(self):
+        write_fixture(self.rtl)
+        (self.rtl / "leaf.v").unlink()
+        write_files(self.rtl, {"leaf.sv": """\
+            module leaf (
+                input logic clk
+            );
+            endmodule
+        """})
+        r = run_tool(self.rtl, write_csv(self.rtl, ROW_DOWN))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("sink_in", (self.rtl / "leaf.sv").read_text())
+        self.assertEqual(elaboration_errors(self.rtl), 0)
+
+    def test_implicit_named_connection_is_wired(self):
+        write_files(self.rtl, {
+            "leaf.sv": """\
+                module leaf (input logic clk, input logic [7:0] d, output logic [7:0] q);
+                    assign q = d;
+                endmodule
+            """,
+            "top.sv": """\
+                module top (input logic clk, input logic [7:0] d);
+                    logic [7:0] q;
+                    leaf u_leaf (.clk, .d, .q);
+                endmodule
+            """})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_tap,8,top/u_leaf.q,top.q_out,tap"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex((self.rtl / "top.sv").read_text(), r"\(\.clk, \.d, \.q[,)]")
+        self.assertEqual(elaboration_errors(self.rtl), 0)
+
+
+class IncludeTests(_TmpRTL):
+    """`include'd files, with the absolute --rtl-dir run_tool always passes."""
+    def _macro_design(self, header):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {
+            header: """\
+                `define DATA_W 8
+            """,
+            "top.v": f"""\
+                `include "{header}"
+                module top (
+                    input                clk,
+                    input  [`DATA_W-1:0] data_in
+                );
+                    mid u_mid (.clk(clk));
+                endmodule
+            """})
+        return write_csv(self.rtl, ROW_DOWN)
+
+    def _module_design(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {
+            "sub.v": """\
+                module sub (input clk);
+                endmodule
+            """,
+            "top.v": """\
+                `include "sub.v"
+                module top (
+                    input        clk,
+                    input  [7:0] data_in
+                );
+                    mid u_mid (.clk(clk));
+                    sub u_sub (.clk(clk));
+                endmodule
+            """})
+
+    def _check_reruns(self, csv):
+        r = run_tool(self.rtl, csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("elaboration error", r.stdout)
+        first = self.snapshot()
+        r = run_tool(self.rtl, csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("0 file(s) written", r.stdout)
+        self.assertEqual(first, self.snapshot())
+
+    def test_macro_header_sorted_after_includer(self):
+        self._check_reruns(self._macro_design("top_defines.v"))
+
+    def test_macro_header_sorted_before_includer(self):
+        self._check_reruns(self._macro_design("a_defines.v"))
+
+    def test_included_module_file_not_edited(self):
+        self._module_design()
+        self._check_reruns(write_csv(self.rtl, ROW_DOWN))
+
+    def test_included_module_file_can_be_edited(self):
+        # The include must see sub.v without the tool's earlier output, or the
+        # rerun would collide with the ports added by the first run.
+        self._module_design()
+        self._check_reruns(write_csv(self.rtl, "w_s,8,top.data_in,top/u_sub.s_in,x"))
+        self.assertIn("s_in", read_all(self.rtl)["sub.v"])
+
+    def test_include_in_inactive_ifdef_is_still_compiled(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {
+            "sub.v": """\
+                module sub (input clk);
+                endmodule
+            """,
+            "top.v": """\
+                `ifdef NEVER_DEFINED
+                `include "sub.v"
+                `endif
+                module top (
+                    input        clk,
+                    input  [7:0] data_in
+                );
+                    mid u_mid (.clk(clk));
+                    sub u_sub (.clk(clk));
+                endmodule
+            """})
+        self._check_reruns(write_csv(self.rtl, "w_s,8,top.data_in,top/u_sub.s_in,x"))
+
+
+class SampleTests(_TmpRTL):
+    """The bundled i2c sample with the bundled wire_connect.csv."""
+    def test_bundled_sample_with_wire_connect_csv(self):
+        shutil.rmtree(self.tmp)
+        shutil.copytree(ROOT / "test_rtl" / "i2c-master", self.tmp)
+        csv = ROOT / "wire_connect.csv"
+        r = run_tool(self.rtl, csv, top="i2c_master_top")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("elaboration error", r.stdout)
+        self.assertIn("test_c", read_all(self.rtl)["i2c_master_bit_ctrl.v"])
+        first = self.snapshot()
+        r = run_tool(self.rtl, csv, top="i2c_master_top")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(first, self.snapshot())
 
 
 # ── optional external-linter cross-check ─────────────────────────────────────
