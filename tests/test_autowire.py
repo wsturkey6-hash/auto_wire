@@ -5,10 +5,14 @@ Run with:  python -m unittest discover -s tests   (from the repo root)
 Covers unit-level helpers, an end-to-end wiring run on a hermetic synthetic
 fixture (assertions on the generated RTL), idempotency (a second run is
 byte-identical), pyslang elaboration of the result, the missing-source fatal
-path, the pyslang import-failure messages, and an optional external linter
-cross-check (skipped if none installed).
+path, the pyslang import-failure messages, regression cases from the 2026-10
+review (routing up through intermediate levels, tapping already-wired outputs,
+parameterized modules and instances, multi-module files, file encodings and
+line endings; simulated with iverilog+vvp when available), and an optional
+external linter cross-check (skipped if none installed).
 """
 import os
+import re
 import sys
 import glob
 import shutil
@@ -17,6 +21,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -288,6 +293,305 @@ class PyslangImportTests(unittest.TestCase):
         r = self._run("-S", "-E")  # no site-packages: pyslang truly absent
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("pip install pyslang", r.stderr)
+
+
+# ── regression cases from the 2026-10 review (items 1–6) ─────────────────────
+IVERILOG = shutil.which("iverilog")
+VVP = shutil.which("vvp")
+SELF_ASSIGN = re.compile(r"\bassign\s+(\w+)\s*=\s*\1\s*;")
+
+
+def write_files(d: Path, files, newline="\n", encoding="utf-8"):
+    for name, text in files.items():
+        (d / name).write_text(textwrap.dedent(text), newline=newline,
+                              encoding=encoding)
+
+
+def write_csv(d: Path, *rows):
+    p = d / "conn.csv"
+    p.write_text("wire_name,bit_width,src,dst,comment\n"
+                 + "".join(r + "\n" for r in rows), newline="\n")
+    return p
+
+
+def simulate(rtldir, tb_text):
+    """Compile rtldir/*.v plus a testbench with iverilog, run it with vvp and
+    return the testbench's '@'-prefixed output lines."""
+    with tempfile.TemporaryDirectory() as d:
+        tb = Path(d) / "tb.v"
+        tb.write_text(textwrap.dedent(tb_text), newline="\n")
+        exe = str(Path(d) / "sim.vvp")
+        vfiles = sorted(glob.glob(os.path.join(str(rtldir), "*.v")))
+        comp = subprocess.run([IVERILOG, "-o", exe, "-s", "tb", str(tb), *vfiles],
+                              capture_output=True, text=True)
+        if comp.returncode != 0:
+            raise AssertionError(comp.stdout + comp.stderr)
+        out = subprocess.run([VVP, "-n", exe], capture_output=True, text=True).stdout
+    return [l for l in out.splitlines() if l.startswith("@")]
+
+
+class _TmpRTL(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.rtl = Path(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def assertClean(self):
+        """Generated RTL elaborates and contains no `assign x = x;`."""
+        self.assertEqual(elaboration_errors(self.rtl), 0,
+                         "generated RTL has elaboration errors")
+        for name, text in read_all(self.rtl).items():
+            self.assertIsNone(SELF_ASSIGN.search(text), f"self-assign in {name}")
+
+
+class DeepSourceTests(_TmpRTL):
+    """Item 1: a source two levels below the LCA is routed up through mid."""
+    def setUp(self):
+        super().setUp()
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (input [7:0] d, output [7:0] q);
+                    assign q = d;
+                endmodule
+            """,
+            "mid.v": """\
+                module mid (input [7:0] d);
+                    leaf u_leaf (.d(d));
+                endmodule
+            """,
+            "top.v": """\
+                module top (input [7:0] d);
+                    mid u_mid (.d(d));
+                endmodule
+            """})
+        self.csv = write_csv(self.rtl, "w_q,8,top/u_mid/u_leaf.q,top.q_out,up two levels")
+
+    def test_no_self_assign(self):
+        r = run_tool(self.rtl, self.csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertClean()
+
+    @unittest.skipUnless(IVERILOG and VVP, "no iverilog/vvp on PATH")
+    def test_routed_value_simulates(self):
+        self.assertEqual(run_tool(self.rtl, self.csv).returncode, 0)
+        lines = simulate(self.rtl, """\
+            module tb;
+                reg  [7:0] d;
+                wire [7:0] q_out;
+                top dut (.d(d), .q_out(q_out));
+                initial begin
+                    d = 8'h00; #1 $display("@ %h %h", d, q_out);
+                    d = 8'h5a; #1 $display("@ %h %h", d, q_out);
+                    d = 8'hff; #1 $display("@ %h %h", d, q_out);
+                end
+            endmodule
+        """)
+        self.assertEqual(len(lines), 3, lines)
+        for line in lines:
+            _, sent, seen = line.split()
+            self.assertEqual(seen, sent, line)
+
+
+class TapWiredOutputTests(_TmpRTL):
+    """Item 2: tapping a source output that is already wired must keep it."""
+    LEAF = """\
+        module leaf (input [7:0] d, output [7:0] q);
+            assign q = d;
+        endmodule
+    """
+
+    def test_existing_connection_and_load_kept(self):
+        write_files(self.rtl, {
+            "leaf.v": self.LEAF,
+            "sink.v": """\
+                module sink (input [7:0] x, output [7:0] y);
+                    assign y = x;
+                endmodule
+            """,
+            "top.v": """\
+                module top (input [7:0] d, output [7:0] y);
+                    wire [7:0] q_net;
+                    leaf u_leaf (.d(d), .q(q_net));
+                    sink u_sink (.x(q_net), .y(y));
+                endmodule
+            """})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_tap,8,top/u_leaf.q,top.tap_out,tap"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(".q(q_net)", read_all(self.rtl)["top.v"])
+        self.assertClean()
+        if IVERILOG and VVP:
+            lines = simulate(self.rtl, """\
+                module tb;
+                    reg  [7:0] d;
+                    wire [7:0] y, tap_out;
+                    top dut (.d(d), .y(y), .tap_out(tap_out));
+                    initial begin
+                        d = 8'h3c; #1 $display("@ %h %h %h", d, y, tap_out);
+                        d = 8'hc3; #1 $display("@ %h %h %h", d, y, tap_out);
+                    end
+                endmodule
+            """)
+            self.assertEqual(len(lines), 2, lines)
+            for line in lines:
+                _, sent, load, tap = line.split()
+                self.assertEqual((load, tap), (sent, sent), line)
+
+    def test_rewritten_connection_restored_on_rerun(self):
+        write_files(self.rtl, {
+            "leaf.v": self.LEAF,
+            "top.v": """\
+                module top (input [7:0] d);
+                    leaf u_leaf (.d(d), .q());
+                endmodule
+            """})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_tap,8,top/u_leaf.q,top.tap_out,tap"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertClean()
+        # Drop the tap; the new row still rewrites both top.v and leaf.v.
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_in,8,top.d,top/u_leaf.extra_in,other"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = read_all(self.rtl)
+        self.assertIn(".q()", files["top.v"])
+        for name, text in files.items():
+            self.assertNotIn("aw-orig", text, name)
+            self.assertNotIn("w_tap", text, name)
+        self.assertClean()
+
+
+class ParameterizedModuleTests(_TmpRTL):
+    """Items 3 and 4: #(parameter) headers and #(.P(v)) instance overrides."""
+    LEAF = """\
+        module leaf #(parameter W = 8) (
+            input          clk,
+            input  [W-1:0] d
+        );
+        endmodule
+    """
+    ROW = "w_data,8,top.data_in,top/u_leaf.sink_in,new port"
+
+    def _check(self, top_v):
+        write_files(self.rtl, {"leaf.v": self.LEAF, "top.v": top_v})
+        r = run_tool(self.rtl, write_csv(self.rtl, self.ROW))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = read_all(self.rtl)
+        self.assertIn("#(parameter W = 8) (", files["leaf.v"])
+        self.assertRegex(files["top.v"], r"\.sink_in\s*\(\s*w_data\s*\)")
+        self.assertClean()
+
+    def test_parameter_header_gets_port(self):
+        self._check("""\
+            module top (input clk, input [7:0] data_in);
+                leaf u_leaf (.clk(clk), .d(data_in));
+            endmodule
+        """)
+
+    def test_single_line_parameter_override(self):
+        self._check("""\
+            module top (input clk, input [7:0] data_in);
+                leaf #(.W(8)) u_leaf (.clk(clk), .d(data_in));
+            endmodule
+        """)
+
+    def test_multi_line_parameter_override(self):
+        self._check("""\
+            module top (input clk, input [7:0] data_in);
+                leaf #(
+                    .W(8)
+                ) u_leaf (
+                    .clk(clk),
+                    .d(data_in)
+                );
+            endmodule
+        """)
+
+    def test_unlocatable_edit_writes_nothing(self):
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf;
+                endmodule
+            """,
+            "top.v": """\
+                module top (input [7:0] data_in);
+                    leaf u_leaf ();
+                endmodule
+            """})
+        before = {p.name: p.read_bytes() for p in self.rtl.glob("*.v")}
+        r = run_tool(self.rtl, write_csv(self.rtl, self.ROW))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("No files written", r.stdout + r.stderr)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.rtl.glob("*.v")})
+
+
+class MultiModuleFileTests(_TmpRTL):
+    """Item 5: two modules in one file both receive their edits."""
+    def test_both_modules_edited(self):
+        write_files(self.rtl, {
+            "mid_leaf.v": """\
+                module leaf (
+                    input clk
+                );
+                endmodule
+
+                module mid (
+                    input clk
+                );
+                    leaf u_leaf (.clk(clk));
+                endmodule
+            """,
+            "top.v": """\
+                module top (
+                    input        clk,
+                    input  [7:0] data_in
+                );
+                    mid u_mid (.clk(clk));
+                endmodule
+            """})
+        csv = write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x")
+        r = run_tool(self.rtl, csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        leaf_part, mid_part = read_all(self.rtl)["mid_leaf.v"].split("module mid")
+        self.assertIn("sink_in", leaf_part)
+        self.assertIn("w_data", mid_part)
+        self.assertClean()
+        first = read_all(self.rtl)
+        self.assertEqual(run_tool(self.rtl, csv).returncode, 0)
+        self.assertEqual(first, read_all(self.rtl), "second run was not byte-identical")
+
+
+class EncodingTests(_TmpRTL):
+    """Item 6: files keep their encoding, untouched bytes and line endings."""
+    COMMENT = "// 中文註解：資料輸入"
+
+    def _run(self, encoding="utf-8", newline="\n"):
+        write_fixture(self.rtl)
+        for p in self.rtl.glob("*.v"):
+            text = p.read_text(encoding="utf-8")
+            if p.name == "leaf.v":
+                text = text.replace("endmodule", self.COMMENT + "\nendmodule")
+            p.write_text(text, encoding=encoding, newline=newline)
+        csv = write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PYTHONUTF8", None)   # the tool's default (locale) mode
+            r = run_tool(self.rtl, csv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        data = (self.rtl / "leaf.v").read_bytes()
+        self.assertIn(b"sink_in", data)
+        return data
+
+    def test_utf8_comment_preserved(self):
+        data = self._run("utf-8")
+        self.assertIn(self.COMMENT.encode("utf-8"), data)
+        data.decode("utf-8")
+
+    def test_big5_comment_preserved(self):
+        data = self._run("cp950")
+        self.assertIn(self.COMMENT.encode("cp950"), data)
+
+    def test_crlf_preserved(self):
+        data = self._run(newline="\r\n")
+        self.assertEqual(data.count(b"\n"), data.count(b"\r\n"))
 
 
 # ── optional external-linter cross-check ─────────────────────────────────────

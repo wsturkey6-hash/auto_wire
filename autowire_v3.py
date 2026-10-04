@@ -35,7 +35,7 @@ autowire_v3.py  ─  SoC Integration Auto-Wiring Tool  v3.0
   python3 autowire_v3.py --rtl-dir ./rtl --top TOP --csv conn.csv --no-color
 """
 
-import re, os, sys, csv, json, argparse, getpass
+import re, os, sys, csv, json, argparse, getpass, locale
 from datetime import date as dt_date
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -150,6 +150,24 @@ def _width_str(w: int) -> str:
     """Render a concrete bit width as a Verilog range, e.g. 8 -> '[7:0]'."""
     return f'[{w-1}:0]' if w and w > 1 else ''
 
+def _read_rtl(path) -> Tuple[str, str, bool]:
+    """Decode an RTL file without losing anything. Returns (text with '\\n'
+    line endings, encoding, had_crlf). Tries UTF-8 (BOM-aware), then the
+    system locale encoding (e.g. cp950 for Big5 files), then latin-1; a
+    candidate is accepted only if it re-encodes to the exact original bytes,
+    so everything the tool doesn't edit is written back byte-for-byte."""
+    data = Path(path).read_bytes()
+    getenc = getattr(locale, 'getencoding', None) or locale.getpreferredencoding
+    for enc in ('utf-8-sig' if data.startswith(b'\xef\xbb\xbf') else 'utf-8',
+                getenc(), 'latin-1'):
+        try:
+            text = data.decode(enc)
+            if text.encode(enc) == data:
+                break
+        except (UnicodeError, LookupError):
+            continue
+    return text.replace('\r\n', '\n'), enc, '\r\n' in text
+
 # ──────────────────────────────────────────────────────────────────────────────
 # RTL DATABASE + HIERARCHY TREE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -169,6 +187,7 @@ class RTLDatabase:
         self._comp = None                    # pyslang Compilation
         self._sm   = None                    # pyslang SourceManager
         self._sources: Dict[str,str] = {}    # filepath -> source text (cached)
+        self._encodings: Dict[str,Tuple[str,bool]] = {}  # filepath -> (encoding, crlf)
         self.elab_error_count = 0            # pyslang elaboration error count
         self.elab_error_text  = ''           # rendered elaboration diagnostics
 
@@ -196,7 +215,7 @@ class RTLDatabase:
             self._comp = Compilation()
         for f in files:
             try:
-                raw = Path(f).read_text(errors='replace')
+                raw, enc, crlf = _read_rtl(f)
             except Exception as e:
                 self.errors.append(f'read error in {f}: {e}')
                 continue
@@ -206,6 +225,7 @@ class RTLDatabase:
             # write-back edits, keyed by the file path.
             clean = _strip_all_aw_content(raw)
             self._sources[str(f)] = clean
+            self._encodings[str(f)] = (enc, crlf)
             try:
                 self._comp.addSyntaxTree(
                     SyntaxTree.fromText(clean, self._sm, str(f), str(f)))
@@ -216,6 +236,14 @@ class RTLDatabase:
             return sum(1 for d in defs if d.definitionKind == DefinitionKind.Module)
         except Exception:
             return 0
+
+    def encode_source(self, filepath: str, text: str) -> bytes:
+        """Encode text for writing back in the file's own encoding and line
+        endings, as detected by _read_rtl when it was scanned."""
+        enc, crlf = self._encodings.get(filepath, ('utf-8', False))
+        if crlf:
+            text = text.replace('\n', '\r\n')
+        return text.encode(enc)
 
     def check_duplicates(self) -> List[str]:
         # pyslang elaboration is authoritative for real conflicts; the old
@@ -317,7 +345,9 @@ class RTLDatabase:
             # Normally populated by scan_dir; strip on the fallback path too so
             # the write-back always starts from pristine source.
             try:
-                source = _strip_all_aw_content(Path(filepath).read_text(errors='replace'))
+                raw, enc, crlf = _read_rtl(filepath)
+                source = _strip_all_aw_content(raw)
+                self._encodings[filepath] = (enc, crlf)
             except Exception:
                 source = ''
             self._sources[filepath] = source
@@ -346,6 +376,10 @@ class RTLDatabase:
                 for pc in m.portConnections:
                     try:
                         expr = pc.expression
+                        if expr is not None and expr.syntax is None:
+                            # An output port binds as an implicit assignment;
+                            # the connected net is its left-hand side.
+                            expr = getattr(expr, 'left', None)
                         conns[pc.port.name] = (str(expr.syntax).strip()
                                                if expr is not None and expr.syntax is not None
                                                else '')
@@ -696,8 +730,15 @@ def _bubble_up(db: RTLDatabase,
     # with the requested width `use_w`. If the existing output has a
     # different width, we add a new port and an assign that pads/truncates
     # the original signal to match `use_w`.
-    if src_si and src_si.direction in ('output', 'inout') and src_si.width == use_w:
-        # Already an output with matching width — expose directly
+    # An existing output is reused only while it is unconnected: re-pointing a
+    # connected port at the crossing wire would leave the net it drives (and
+    # every load on it) undriven, so a connected output is tapped instead.
+    parent_def = db.module_at(src_path.rsplit('/', 1)[0])
+    src_inst   = parent_def.instances.get(levels[-1]) if parent_def else None
+    src_wired  = bool(src_inst and src_inst.connections.get(src_port))
+    if (src_si and src_si.direction in ('output', 'inout') and src_si.width == use_w
+            and not src_wired):
+        # Already an unconnected output with matching width — expose directly
         expose_name = src_port
     else:
         # Add a new output port (named after the crossing wire)
@@ -720,10 +761,11 @@ def _bubble_up(db: RTLDatabase,
                 cs.add_assign(src_mod_name, expose_name, rhs,
                               f'WIDTH MISMATCH {src_si.width}b->{use_w}b')
             else:
-                # same width but not an output previously — expose directly
-                if src_si.direction != 'output':
-                    cs.add_assign(src_mod_name, expose_name, src_port,
-                                  f'expose internal {src_port} for hierarchy crossing')
+                # same width: drive the new port straight from the source
+                kind = ('tap' if src_si.direction in ('output', 'inout')
+                        else 'expose internal')
+                cs.add_assign(src_mod_name, expose_name, src_port,
+                              f'{kind} {src_port} for hierarchy crossing')
 
     # Walk UP from src toward lca
     # levels[0] = instance just below lca, levels[-1] = instance at src_path
@@ -737,15 +779,13 @@ def _bubble_up(db: RTLDatabase,
         inst_name    = levels[depth]
 
         if depth < len(levels) - 1:
-            # Intermediate module: add both input (from below) + output (to above)
-            # Only add the output port in the child if it doesn't already exist.
+            # Intermediate module: expose the signal through a new output port.
+            # The child instance below connects straight to that port, so no
+            # assign is needed (one here would be `assign w = w;`, a loop that
+            # holds the net at x).
             child_def = db.modules.get(child_mod)
             if not (child_def and (wire_name in child_def.ports or wire_name in child_def.wires)):
                 cs.add_port(child_mod, wire_name, 'output', ws)
-            # Connect from what came in from below to this new output (or existing)
-            if depth + 1 <= len(levels) - 1:
-                cs.add_assign(child_mod, wire_name, current_sig,
-                              'pass-through hierarchy crossing')
 
         # In parent: update instantiation of inst_name to connect wire_name
         sig_in_parent = wire_name if depth > 0 else wire_name
@@ -850,6 +890,10 @@ def _stamp(user: str) -> str:
 # SHORT stamp for inline use – must NOT contain MARK_BEGIN/END text
 _INLINE_STAMP_PREFIX = '// aw:'
 
+# Marker left after a connection the tool rewrote in place; it holds the
+# original `.port(...)` text so _strip_all_aw_content can restore it.
+_ORIG_OPEN, _ORIG_CLOSE = '/*aw-orig:', '*/'
+
 def _inline_stamp(user: str) -> str:
     return f'{_INLINE_STAMP_PREFIX}{user} {dt_date.today()}'
 
@@ -883,6 +927,76 @@ def _find_balanced(text: str, pos: int, oc: str = '(', cc: str = ')') -> int:
         elif text[i] == cc: depth -= 1
         i += 1
     return i - 1
+
+def _find_balanced_back(text: str, pos: int, oc: str = '(', cc: str = ')') -> int:
+    """Find position of the matching open-char scanning back from pos (close-char); -1 if none."""
+    depth = 1; i = pos - 1
+    while i >= 0:
+        if   text[i] == cc: depth += 1
+        elif text[i] == oc:
+            depth -= 1
+            if depth == 0: return i
+        i -= 1
+    return -1
+
+def _skip_ws(text: str, i: int) -> int:
+    while i < len(text) and text[i].isspace(): i += 1
+    return i
+
+def _skip_ws_back(text: str, i: int) -> int:
+    while i >= 0 and text[i].isspace(): i -= 1
+    return i
+
+class WriteBackError(Exception):
+    """The write-back cannot tell where an edit belongs. Raised instead of
+    skipping the edit or corrupting the file; main() then writes nothing."""
+
+def _module_span(masked: str, mod_name: str) -> Optional[Tuple[int, int]]:
+    """(start, end) of `module NAME ... endmodule` in comment-masked text."""
+    m = re.search(r'\bmodule\s+' + re.escape(mod_name) + r'\b', masked)
+    e = re.compile(r'\bendmodule\b').search(masked, m.end()) if m else None
+    return (m.start(), e.end()) if e else None
+
+def _port_list_span(masked: str, mod_name: str) -> Optional[Tuple[int, int]]:
+    """(open, close) parens of a module header's port list in comment-masked
+    text, skipping a `#( ... )` parameter list; None if the header has none."""
+    m = re.search(r'\bmodule\s+' + re.escape(mod_name) + r'\b', masked)
+    if not m:
+        return None
+    i = _skip_ws(masked, m.end())
+    if masked.startswith('#', i):
+        i = _skip_ws(masked, i + 1)
+        if not masked.startswith('(', i):
+            return None
+        i = _skip_ws(masked, _find_balanced(masked, i) + 1)
+    if masked.startswith('(', i):
+        return i, _find_balanced(masked, i)
+    return None
+
+def _find_instance(masked: str, inst_name: str):
+    """Locate the instantiation of inst_name in comment-masked text. Returns
+    (statement_start, open, close) of its port-connection parens, or None.
+    Handles `Type inst (` and `Type #( ... ) inst (` with nested or multi-line
+    parameter overrides, plus later instances of a multi-instance statement
+    (`..., inst (`), whose statement_start is None."""
+    for m in re.finditer(r'\b' + re.escape(inst_name) + r'\s*\(', masked):
+        i = _skip_ws_back(masked, m.start() - 1)
+        if i >= 0 and masked[i] == ')':                  # #( ... ) override
+            i = _skip_ws_back(masked, _find_balanced_back(masked, i) - 1)
+            if i < 0 or masked[i] != '#':
+                continue
+            i = _skip_ws_back(masked, i - 1)
+        if i >= 0 and (masked[i].isalnum() or masked[i] in '_$'):
+            while i >= 0 and (masked[i].isalnum() or masked[i] in '_$'):
+                i -= 1
+            start = i + 1                                # the module type
+        elif i >= 0 and masked[i] == ',':
+            start = None
+        else:
+            continue
+        open_pos = m.end() - 1
+        return start, open_pos, _find_balanced(masked, open_pos)
+    return None
 
 def _build_auto_block(mc: ModChanges, user: str) -> str:
     lines = [f'{MARK_BEGIN}  {_stamp(user)}  tool:autowire_v3.py', '']
@@ -920,20 +1034,15 @@ def _insert_inst_connections(source: str, inst_name: str,
     Works directly on source with comment-masked positions to avoid offset bugs.
     """
     masked = _mask_comments(source)          # same length as source
-    pat = re.compile(
-        r'\b\w+\s*(?:#\s*\([^)]*\))?\s*'
-        + re.escape(inst_name) + r'\s*\(',
-        re.MULTILINE)
-    m = pat.search(masked)
-    if not m: return source
-
-    # open_pos = the '(' that starts the port connection list
-    open_pos  = masked.rfind('(', 0, m.end())
-    close_pos = _find_balanced(masked, open_pos)   # positions valid for source too
+    found  = _find_instance(masked, inst_name)
+    if not found:
+        raise WriteBackError(f'cannot locate the instantiation of "{inst_name}"')
+    _, open_pos, close_pos = found           # positions valid for source too
 
     # Replace any existing .port(...) entries for ports we are updating,
     # and append any missing connections (keeping the inline-stamp format
-    # for later idempotent removal).
+    # for later idempotent removal). A replaced entry keeps its original
+    # text in an aw-orig marker so the strip can restore it.
     conn_text = source[open_pos+1:close_pos]
     conn_re = re.compile(r'\.\s*(\w+)\s*\(\s*([^)]*?)\s*\)', re.MULTILINE)
 
@@ -942,13 +1051,20 @@ def _insert_inst_connections(source: str, inst_name: str,
     def _repl(m):
         pname = m.group(1)
         if pname in new_conns:
-            return f'.{pname} ( {new_conns[pname]} )'
+            if _ORIG_CLOSE in m.group(0):
+                raise WriteBackError(f'cannot rewrite "{m.group(0)}" of "{inst_name}"')
+            return (f'.{pname} ( {new_conns[pname]} ) '
+                    f'{_ORIG_OPEN}{m.group(0)}{_ORIG_CLOSE}')
         return m.group(0)
 
     new_conn_text = conn_re.sub(_repl, conn_text)
 
     missing = [p for p in new_conns.keys() if p not in existing_ports]
     if missing:
+        if not masked[open_pos+1:close_pos].strip().startswith('.'):
+            raise WriteBackError(
+                f'instance "{inst_name}" has an empty or positional connection '
+                f'list; adding named connections to it is not supported')
         stamp = _inline_stamp(user)
         parts = [f',  {stamp}\n    .{p:<40} ( {new_conns[p]} )' for p in missing]
         additions = ''.join(parts)
@@ -961,18 +1077,19 @@ def _add_ports_to_header(source: str, mod_name: str,
                          user: str) -> str:
     """Add port declarations to the module header port list."""
     masked = _mask_comments(source)
-    pat    = re.compile(r'\bmodule\s+' + re.escape(mod_name) + r'\b')
-    m      = pat.search(masked)
-    if not m: return source
-    po = masked.find('(', m.end())
-    if po < 0: return source
-    pc    = _find_balanced(masked, po)
+    span   = _port_list_span(masked, mod_name)
+    if span is None:
+        raise WriteBackError(f'cannot locate the port list of module "{mod_name}"')
+    po, pc = span
     stamp = _inline_stamp(user)
     # If module header already contains direction keywords (ANSI style)
     # insert typed declarations into the header. Otherwise (legacy style)
     # insert plain names in the header and add body-style declarations
     # separately.
     header_text = masked[po+1:pc]
+    if not header_text.strip():
+        raise WriteBackError(f'module "{mod_name}" has an empty port list; '
+                             f'adding ports to it is not supported')
     if re.search(r'\b(input|output|inout)\b', header_text):
         additions = ''.join(
             f',  {stamp}\n    {pdir} wire{(" "+pws) if pws else ""} {pname}'
@@ -996,14 +1113,10 @@ def _add_port_decls_to_body(source: str, mod_name: str,
     do not add body declarations to avoid duplicate declarations.
     """
     masked = _mask_comments(source)
-    pat = re.compile(r'\bmodule\s+' + re.escape(mod_name) + r'\b')
-    m = pat.search(masked)
-    if not m:
+    span = _port_list_span(masked, mod_name)
+    if span is None:
         return source
-    po = masked.find('(', m.end())
-    if po < 0:
-        return source
-    pc = _find_balanced(masked, po)
+    po, pc = span
     header_text = masked[po+1:pc]
     # If header already contains direction keywords, skip body insertion.
     if re.search(r'\b(input|output|inout)\b', header_text):
@@ -1033,12 +1146,13 @@ def _replace_auto_block(source: str, block: str, mod_name: str = '',
     ei = masked.find(MARK_END)
     if bi >= 0 and ei >= 0:
         return source[:bi] + block + source[ei + len(MARK_END):]
-    # Earliest instance instantiation position.
+    # Earliest instantiation statement; inserting at the start of its first
+    # line never splits a multi-line `Type #( ... ) inst (` statement.
     first = None
     for iname in inst_names:
-        m = re.search(r'\b' + re.escape(iname) + r'\s*\(', masked)
-        if m and (first is None or m.start() < first):
-            first = m.start()
+        found = _find_instance(masked, iname)
+        if found and found[0] is not None and (first is None or found[0] < first):
+            first = found[0]
     if first is not None:
         line_start = source.rfind('\n', 0, first) + 1
         return source[:line_start] + block + '\n\n' + source[line_start:]
@@ -1089,29 +1203,69 @@ def _strip_all_aw_content(source: str) -> str:
         r'[^\n]*\n[ \t]*(?:input|output|inout)\s+wire(?:\s*\[[^\]]*\])?\s+\w+\s*;\n)+',
         '', source)
 
-    return source
-
-
-def apply_changes(mod: ModuleDef, mc: ModChanges, user: str) -> str:
-    # 0. Strip ALL previously generated content so every run is idempotent
-    source = _strip_all_aw_content(mod.source)
-
-    # 1. Update instantiation connections
-    for inst_name, port_map in mc.inst_updates.items():
-        source = _insert_inst_connections(source, inst_name, port_map, user)
-
-    # 2. Add hierarchy-crossing ports to module header
-    if mc.port_adds:
-        source = _add_ports_to_header(source, mod.name, mc.port_adds, user)
-        # Also add semicolon-terminated body-style declarations for legacy modules
-        source = _add_port_decls_to_body(source, mod.name, mc.port_adds, user)
-
-    # 3. Insert AUTO_WIRE_BEGIN … AUTO_WIRE_END block right after the header
-    block  = _build_auto_block(mc, user)
-    source = _replace_auto_block(source, block, mod.name,
-                                 list(mod.instances.keys()))
+    # ── 3. Restore connections the tool rewrote in place ─────────────────────
+    #     .port ( new ) /*aw-orig:.port(original)*/  →  .port(original)
+    source = re.sub(
+        r'\.\w+[ \t]*\([^)]*\)[ \t]*' + re.escape(_ORIG_OPEN) + r'(.*?)'
+        + re.escape(_ORIG_CLOSE),
+        lambda m: m.group(1), source, flags=re.DOTALL)
 
     return source
+
+
+def apply_changes(text: str, mod: ModuleDef, mc: ModChanges, user: str) -> str:
+    """Apply one module's changes to the full text of its file and return the
+    new text. Edits stay inside that module's `module ... endmodule` span, so
+    several modules sharing one file can be applied one after another."""
+    span = _module_span(_mask_comments(text), mod.name)
+    if span is None:
+        raise WriteBackError(f'{mod.filepath}: cannot locate "module {mod.name}"')
+    s, e = span
+    source = text[s:e]
+    try:
+        # 1. Update instantiation connections
+        for inst_name, port_map in mc.inst_updates.items():
+            source = _insert_inst_connections(source, inst_name, port_map, user)
+
+        # 2. Add hierarchy-crossing ports to module header
+        if mc.port_adds:
+            source = _add_ports_to_header(source, mod.name, mc.port_adds, user)
+            # Also add semicolon-terminated body-style declarations for legacy modules
+            source = _add_port_decls_to_body(source, mod.name, mc.port_adds, user)
+
+        # 3. Insert AUTO_WIRE_BEGIN … AUTO_WIRE_END block right after the header
+        block  = _build_auto_block(mc, user)
+        source = _replace_auto_block(source, block, mod.name,
+                                     list(mod.instances.keys()))
+    except WriteBackError as ex:
+        raise WriteBackError(f'{mod.filepath} (module {mod.name}): {ex}') from None
+
+    return text[:s] + source + text[e:]
+
+def render_outputs(db: RTLDatabase, cs: ChangeSet, user: str) -> Dict[str, bytes]:
+    """New bytes for every file holding a module with planned changes. Modules
+    sharing a file are applied one after another to the same text, and every
+    file is rendered before anything is written, so a WriteBackError leaves
+    all files untouched."""
+    by_file: Dict[str, List[Tuple[ModuleDef, ModChanges]]] = {}
+    for mn, mc in cs.all_modules().items():
+        mod = db.modules.get(mn)
+        if not mod:
+            print(col(f'  WARN: module "{mn}" not in DB, skipping', C.YELLOW))
+            continue
+        by_file.setdefault(mod.filepath, []).append((mod, mc))
+
+    outputs: Dict[str, bytes] = {}
+    for fp, items in by_file.items():
+        text = items[0][0].source            # the file's pristine text
+        for mod, mc in items:
+            text = apply_changes(text, mod, mc, user)
+        try:
+            outputs[fp] = db.encode_source(fp, text)
+        except UnicodeEncodeError as ex:
+            raise WriteBackError(f'{fp}: the new content cannot be encoded as '
+                                 f'{ex.encoding}') from None
+    return outputs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # REPORTING
@@ -1399,6 +1553,14 @@ ENDPOINT FORMAT
         print()
         for w in warn_msgs: print(w)
 
+    # ── Render every edited file before asking or writing anything ────────────
+    try:
+        outputs = render_outputs(db, cs, user)
+    except WriteBackError as e:
+        print(col(f'\n  WRITE-BACK ERROR: {e}', C.RED, C.BOLD))
+        print(col('  No files written.', C.RED))
+        sys.exit(1)
+
     # ── Confirm before writing ────────────────────────────────────────────────
     if not args.dry_run:
         print(f'\n  {hr()}')
@@ -1420,20 +1582,13 @@ ENDPOINT FORMAT
 
         # ── Apply changes ─────────────────────────────────────────────────────
         written = 0
-        for mn, mc in cs.all_modules().items():
-            mod = db.modules.get(mn)
-            if not mod:
-                print(col(f'  WARN: module "{mn}" not in DB, skipping', C.YELLOW))
-                continue
-            new_src = apply_changes(mod, mc, user)
-            if new_src != mod.source:
-                # Write UTF-8 with explicit LF so re-runs don't churn line
-                # endings (source is read with universal newlines → '\n').
-                Path(mod.filepath).write_text(new_src, encoding='utf-8', newline='\n')
-                print(col(f'  ✓  {mod.filepath}', C.GREEN))
+        for fp, data in outputs.items():
+            if Path(fp).read_bytes() != data:
+                Path(fp).write_bytes(data)
+                print(col(f'  ✓  {fp}', C.GREEN))
                 written += 1
             else:
-                print(col(f'  ─  {mod.filepath}  (unchanged)', C.DIM))
+                print(col(f'  ─  {fp}  (unchanged)', C.DIM))
 
         print(col(f'\n  {written} file(s) written.', C.GREEN if written else C.DIM))
     else:

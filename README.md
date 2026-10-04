@@ -58,4 +58,9 @@ See [`example_connections.csv`](example_connections.csv) for a worked example.
   instance); a module instantiated with divergent parameter widths uses a
   single width in the rewrite.
 - Write-back is text-based and only manages content inside its own `AUTO_WIRE`
-  markers / inline `// aw:` stamps.
+  markers, inline `// aw:` stamps, and `/*aw-orig:…*/` markers (these keep the
+  original text of a connection the tool rewrote, so it can be restored).
+- Files keep their encoding (UTF-8, Big5/cp950, …) and line endings. If an edit
+  can't be placed safely, e.g. a module without a port list or an instance with
+  an empty or positional connection list, the tool stops with a
+  `WRITE-BACK ERROR` and writes no files.
