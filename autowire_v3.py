@@ -188,6 +188,8 @@ class RTLDatabase:
         self._sm   = None                    # pyslang SourceManager
         self._sources: Dict[str,str] = {}    # filepath -> source text (cached)
         self._encodings: Dict[str,Tuple[str,bool]] = {}  # filepath -> (encoding, crlf)
+        self._stale: set = set()             # files still holding tool output
+        self._canon: Dict[str,str] = {}      # normalized abs path -> scan key
         self.elab_error_count = 0            # pyslang elaboration error count
         self.elab_error_text  = ''           # rendered elaboration diagnostics
 
@@ -226,6 +228,9 @@ class RTLDatabase:
             clean = _strip_all_aw_content(raw)
             self._sources[str(f)] = clean
             self._encodings[str(f)] = (enc, crlf)
+            self._canon[os.path.normcase(os.path.abspath(f))] = str(f)
+            if clean != raw:
+                self._stale.add(str(f))
             try:
                 self._comp.addSyntaxTree(
                     SyntaxTree.fromText(clean, self._sm, str(f), str(f)))
@@ -244,6 +249,10 @@ class RTLDatabase:
         if crlf:
             text = text.replace('\n', '\r\n')
         return text.encode(enc)
+
+    def stale_sources(self) -> Dict[str, str]:
+        """Pristine text of each scanned file that still holds tool output."""
+        return {fp: self._sources[fp] for fp in sorted(self._stale)}
 
     def check_duplicates(self) -> List[str]:
         # pyslang elaboration is authoritative for real conflicts; the old
@@ -340,6 +349,9 @@ class RTLDatabase:
 
     def _module_from_body(self, body) -> ModuleDef:
         filepath = self._sm.getFileName(body.location)
+        # pyslang reports a path relative to the cwd when it can; map it back
+        # to the key scan_dir used, so one file never ends up with two keys.
+        filepath = self._canon.get(os.path.normcase(os.path.abspath(filepath)), filepath)
         source = self._sources.get(filepath)
         if source is None:
             # Normally populated by scan_dir; strip on the fallback path too so
@@ -348,6 +360,8 @@ class RTLDatabase:
                 raw, enc, crlf = _read_rtl(filepath)
                 source = _strip_all_aw_content(raw)
                 self._encodings[filepath] = (enc, crlf)
+                if source != raw:
+                    self._stale.add(filepath)
             except Exception:
                 source = ''
             self._sources[filepath] = source
@@ -589,6 +603,21 @@ class ChangeSet:
         mc = self._get(mod_name)
         mc.inst_updates.setdefault(inst_name, {})[port_name] = signal_name
 
+    def connection(self, mod_name: str, inst_name: str,
+                   port_name: str) -> Optional[str]:
+        """Signal a planned change connects to inst_name.port_name, if any."""
+        mc = self._changes.get(mod_name)
+        return mc.inst_updates.get(inst_name, {}).get(port_name) if mc else None
+
+    def merge(self, other: 'ChangeSet'):
+        for mn, mc in other.all_modules().items():
+            for p in mc.port_adds:   self.add_port(mn, *p)
+            for w in mc.wire_adds:   self.add_wire(mn, *w)
+            for a in mc.assign_adds: self.add_assign(mn, *a)
+            for inst, conns in mc.inst_updates.items():
+                for port, sig in conns.items():
+                    self.update_inst(mn, inst, port, sig)
+
     def all_modules(self) -> Dict[str, ModChanges]:
         return self._changes
 
@@ -597,7 +626,8 @@ class ChangeSet:
 # ──────────────────────────────────────────────────────────────────────────────
 def plan_connection(db: RTLDatabase, spec: ConnSpec,
                     cs: ChangeSet, warnings: List[str],
-                    mismatches: List[MismatchInfo]):
+                    mismatches: List[MismatchInfo],
+                    claimed: Optional[ChangeSet] = None):
     """
     Plan all RTL changes required to route spec.src_path.spec.src_port
     to spec.dst_path.spec.dst_port via spec.wire_name.
@@ -634,9 +664,13 @@ def plan_connection(db: RTLDatabase, spec: ConnSpec,
     dst_w  = dst_si.width if dst_si else use_w
     ws     = f'[{use_w-1}:0]' if use_w > 1 else ''
 
+    # ── LCA computation ───────────────────────────────────────────────────────
+    lca = _lca(src_path, dst_path)
+    lca_mod = db.mod_name_at(lca)
+
     # ── Width mismatch (handle dst-side adaptation). We adapt crossing wire
     # to the destination port width if necessary by inserting an adapter
-    # wire+assign in the parent of the dst_path.
+    # wire+assign where the dst connection is made.
     adapted_name = wname   # what we connect at the dst end
     if dst_w != use_w:
         if dst_w > use_w:
@@ -650,10 +684,10 @@ def plan_connection(db: RTLDatabase, spec: ConnSpec,
         adapted_name = f'w_adapt_{wname}'
         adapt_ws     = f'[{dst_w-1}:0]' if dst_w > 1 else ''
 
-        # The adapt wire + assign live at the LCA-to-dst chain start,
-        # concretely inside the parent of dst_path
-        dst_parent  = dst_path.rsplit('/', 1)[0] if '/' in dst_path else dst_path
-        dst_par_mod = db.mod_name_at(dst_parent)
+        # The adapt wire + assign live where the dst connection is made: in
+        # the LCA itself when dst is in its own scope, else in dst's parent
+        dst_scope   = lca if dst_path == lca else dst_path.rsplit('/', 1)[0]
+        dst_par_mod = db.mod_name_at(dst_scope)
         cs.add_wire  (dst_par_mod, adapted_name, adapt_ws)
         cs.add_assign(dst_par_mod, adapted_name, rhs,
                   f'WIDTH MISMATCH {use_w}b->{dst_w}b')
@@ -669,29 +703,13 @@ def plan_connection(db: RTLDatabase, spec: ConnSpec,
             f'  [{spec.row_num}] {wname}: {src_port}({src_w}b) -> '
             f'{dst_port}({dst_w}b)  ->  {note}')
 
-    # ── LCA computation ───────────────────────────────────────────────────────
-    lca = _lca(src_path, dst_path)
-    lca_mod = db.mod_name_at(lca)
-
-    same_scope = (src_path == dst_path)
-
-    # ── Same-scope shortcut (both endpoints in the same module) ───────────────
-    if same_scope:
-        # Just declare wire + connect both ends
-        cs.add_wire(lca_mod, wname, ws)
-        # src side: connect src_port to wire via assign
-        cs.add_assign(lca_mod, wname, src_port, f'same-scope alias for {src_port}')
-        # dst side: update instantiation if dst is an inst inside this module
-        # dst_path == src_path, dst_port is a port on an instance here
-        # We need to find which instance holds dst_port
-        _connect_to_dst(db, spec, dst_path, dst_port, adapted_name, cs)
-        return
-
     # ── Declare crossing wire at LCA ──────────────────────────────────────────
+    # (src and dst in one module need no special case: both ends are then in
+    # the LCA's own scope, which _bubble_up and _bubble_down handle)
     cs.add_wire(lca_mod, wname, ws)
 
     # ── Bubble UP: src_path → LCA ─────────────────────────────────────────────
-    _bubble_up(db, src_path, src_port, lca, wname, ws, cs, use_w)
+    _bubble_up(db, src_path, src_port, lca, wname, ws, cs, use_w, claimed)
 
     # ── Bubble DOWN: LCA → dst_path ───────────────────────────────────────────
     _bubble_down(db, lca, dst_path, wname, ws, adapted_name, dst_port, cs)
@@ -700,7 +718,8 @@ def plan_connection(db: RTLDatabase, spec: ConnSpec,
 def _bubble_up(db: RTLDatabase,
                src_path: str, src_port: str,
                lca: str, wire_name: str, ws: str,
-               cs: ChangeSet, use_w: int):
+               cs: ChangeSet, use_w: int,
+               claimed: Optional[ChangeSet] = None):
     """
     Add output ports at each level from src_path up to (but not including) lca,
     and update instantiation connections at each parent.
@@ -733,9 +752,13 @@ def _bubble_up(db: RTLDatabase,
     # An existing output is reused only while it is unconnected: re-pointing a
     # connected port at the crossing wire would leave the net it drives (and
     # every load on it) undriven, so a connected output is tapped instead.
-    parent_def = db.module_at(src_path.rsplit('/', 1)[0])
+    # An output an earlier row already claimed counts as connected, so fanning
+    # one source out to several rows taps it once per row.
+    src_parent = src_path.rsplit('/', 1)[0]
+    parent_def = db.module_at(src_parent)
     src_inst   = parent_def.instances.get(levels[-1]) if parent_def else None
-    src_wired  = bool(src_inst and src_inst.connections.get(src_port))
+    src_wired  = bool(src_inst and src_inst.connections.get(src_port)) or bool(
+        claimed and claimed.connection(db.mod_name_at(src_parent), levels[-1], src_port))
     if (src_si and src_si.direction in ('output', 'inout') and src_si.width == use_w
             and not src_wired):
         # Already an unconnected output with matching width — expose directly
@@ -743,9 +766,7 @@ def _bubble_up(db: RTLDatabase,
     else:
         # Add a new output port (named after the crossing wire)
         expose_name = wire_name
-        src_mod_def = db.modules.get(src_mod_name)
-        if not (src_mod_def and (expose_name in src_mod_def.ports or expose_name in src_mod_def.wires)):
-            cs.add_port(src_mod_name, expose_name, 'output', ws)
+        cs.add_port(src_mod_name, expose_name, 'output', ws)
 
         # If we know the source signal width, add an assign to adapt widths
         if src_si:
@@ -783,9 +804,7 @@ def _bubble_up(db: RTLDatabase,
             # The child instance below connects straight to that port, so no
             # assign is needed (one here would be `assign w = w;`, a loop that
             # holds the net at x).
-            child_def = db.modules.get(child_mod)
-            if not (child_def and (wire_name in child_def.ports or wire_name in child_def.wires)):
-                cs.add_port(child_mod, wire_name, 'output', ws)
+            cs.add_port(child_mod, wire_name, 'output', ws)
 
         # In parent: update instantiation of inst_name to connect wire_name
         sig_in_parent = wire_name if depth > 0 else wire_name
@@ -843,14 +862,10 @@ def _bubble_down(db: RTLDatabase,
 
             # The parent module needs input port wire_name if it's not the LCA
             if parent_path != lca:
-                parent_def = db.modules.get(parent_mod)
-                if not (parent_def and wire_name in parent_def.ports):
-                    cs.add_port(parent_mod, wire_name, 'input', ws)
+                cs.add_port(parent_mod, wire_name, 'input', ws)
         else:
-            # Intermediate level: add input port for wire_name (if needed)
-            child_def = db.modules.get(child_mod)
-            if not (child_def and (wire_name in child_def.ports or wire_name in child_def.wires)):
-                cs.add_port(child_mod, wire_name, 'input', ws)
+            # Intermediate level: add input port for wire_name
+            cs.add_port(child_mod, wire_name, 'input', ws)
             # Parent updates instantiation of this inst
             cs.update_inst(parent_mod, inst_name, wire_name, wire_name)
 
@@ -864,19 +879,44 @@ def _bubble_down(db: RTLDatabase,
                 cs.add_port(dst_par_mod, wire_name, 'input', ws)
 
 
-def _connect_to_dst(db, spec, scope_path, dst_port, signal_name, cs):
-    """
-    In same-scope case: find which instance holds dst_port and update it.
-    """
-    scope_mod = db.module_at(scope_path)
-    if not scope_mod: return
-    for iname, inst in scope_mod.instances.items():
-        if dst_port in inst.connections or (
-            db.modules.get(inst.module_name) and
-                dst_port in (db.modules[inst.module_name].ports or {})
-        ):
-            cs.update_inst(db.mod_name_at(scope_path), iname, dst_port, signal_name)
-            return
+def plan_conflicts(db: RTLDatabase, row: ChangeSet, done: ChangeSet,
+                   spec: ConnSpec) -> List[str]:
+    """Problems one row's planned changes would cause. Scanning strips the
+    tool's own output first, so a name a module already has is a user signal
+    and declaring it again is a collision. A name declared two different ways
+    (e.g. a module met on both sides of the route), or an instance port an
+    earlier row already connects elsewhere, can't be written either."""
+    errs: List[str] = []
+    ours = (spec.wire_name, f'w_adapt_{spec.wire_name}')
+    for mn, mc in row.all_modules().items():
+        mod  = db.modules.get(mn)
+        have = (set(mod.ports) | set(mod.wires)) if mod else set()
+        kinds: Dict[str, set] = {}
+        for m in (done.all_modules().get(mn), mc):
+            for p, d, w in (m.port_adds if m else []):
+                kinds.setdefault(p, set()).add(f'{d} {w}'.strip())
+            for n, w in (m.wire_adds if m else []):
+                kinds.setdefault(n, set()).add(f'wire {w}'.strip())
+        added = [p for p, _, _ in mc.port_adds] + [n for n, _ in mc.wire_adds]
+        for name in dict.fromkeys(added):
+            if name in have:
+                hint = '; choose another wire_name' if name in ours else ''
+                errs.append(f'Row {spec.row_num}: "{name}" already exists in '
+                            f'module "{mn}"{hint}')
+            elif len(kinds[name]) > 1:
+                errs.append(f'Row {spec.row_num}: module "{mn}" would declare '
+                            f'"{name}" in conflicting ways '
+                            f'({", ".join(sorted(kinds[name]))}); the route passes '
+                            f'through that module more than once, or wire_name '
+                            f'equals another port name')
+        for inst, conns in mc.inst_updates.items():
+            for port, sig in conns.items():
+                prev = done.connection(mn, inst, port)
+                if prev is not None and prev != sig:
+                    errs.append(f'Row {spec.row_num}: port "{port}" of instance '
+                                f'"{inst}" in module "{mn}" is already connected '
+                                f'to "{prev}" by an earlier row')
+    return errs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WRITE-BACK ENGINE
@@ -1243,10 +1283,11 @@ def apply_changes(text: str, mod: ModuleDef, mc: ModChanges, user: str) -> str:
     return text[:s] + source + text[e:]
 
 def render_outputs(db: RTLDatabase, cs: ChangeSet, user: str) -> Dict[str, bytes]:
-    """New bytes for every file holding a module with planned changes. Modules
-    sharing a file are applied one after another to the same text, and every
-    file is rendered before anything is written, so a WriteBackError leaves
-    all files untouched."""
+    """New bytes for every file holding a module with planned changes, plus
+    every scanned file that still holds stale tool output. Modules sharing a
+    file are applied one after another to the same text, and every file is
+    rendered before anything is written, so a WriteBackError leaves all files
+    untouched."""
     by_file: Dict[str, List[Tuple[ModuleDef, ModChanges]]] = {}
     for mn, mc in cs.all_modules().items():
         mod = db.modules.get(mn)
@@ -1265,6 +1306,13 @@ def render_outputs(db: RTLDatabase, cs: ChangeSet, user: str) -> Dict[str, bytes
         except UnicodeEncodeError as ex:
             raise WriteBackError(f'{fp}: the new content cannot be encoded as '
                                  f'{ex.encoding}') from None
+
+    # Files no planned module touches but that still hold output from an
+    # earlier run go back to their pristine text: the RTL always matches the
+    # CSV, so a removed row leaves nothing behind.
+    for fp, text in db.stale_sources().items():
+        if fp not in outputs:
+            outputs[fp] = db.encode_source(fp, text)
     return outputs
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1480,10 +1528,6 @@ ENDPOINT FORMAT
         print(col(f'\n  CSV ERROR: {e}', C.RED))
         sys.exit(1)
 
-    if not conns:
-        print(col('\n  No connections found in CSV. Nothing to do.', C.YELLOW))
-        sys.exit(0)
-
     print(col(f'  Connections: {len(conns)} loaded', C.GREEN))
 
     # ── Validate endpoints ────────────────────────────────────────────────────
@@ -1522,6 +1566,50 @@ ENDPOINT FORMAT
                                f'{side} port "{port}" not found in module '
                                f'"{n.module_name}" (may be external IP)', C.YELLOW))
 
+    # ── Validate destinations ─────────────────────────────────────────────────
+    seen_dst: Dict[Tuple[str, str], int] = {}
+    for spec in conns:
+        r, key = spec.row_num, (spec.dst_path, spec.dst_port)
+        if key in seen_dst:
+            validation_errors.append(
+                f'  Row {r}: dst "{spec.dst_path}.{spec.dst_port}" is also driven '
+                f'by row {seen_dst[key]}; a destination can have only one source.')
+            continue
+        seen_dst[key] = r
+        if key == (spec.src_path, spec.src_port):
+            validation_errors.append(f'  Row {r}: src and dst are the same signal.')
+            continue
+        n   = db.node(spec.dst_path) if '[' not in spec.dst_path else None
+        mod = db.modules.get(n.module_name) if n else None
+        if not mod:
+            continue                         # path errors are reported above
+        where  = f'dst "{spec.dst_port}" of module "{mod.name}"'
+        si     = mod.ports.get(spec.dst_port)
+        at_lca = spec.dst_path == _lca(spec.src_path, spec.dst_path)
+        if spec.dst_port in mod.wires:
+            validation_errors.append(
+                f'  Row {r}: {where} is an internal signal, not a port.')
+        elif si and at_lca and si.direction == 'input':
+            # dst in the LCA's own scope is driven by an assign inside it
+            validation_errors.append(
+                f'  Row {r}: {where} is an input; it cannot be driven from '
+                f'inside that module.')
+        elif si and at_lca:
+            print(col(f'  WARN row {r}: {where} is an existing {si.direction}; '
+                      f'it will be driven by an assign, so make sure nothing '
+                      f'else drives it', C.YELLOW))
+        elif si and si.direction == 'output':
+            validation_errors.append(
+                f'  Row {r}: {where} is an output; a destination must be an input.')
+        elif si:
+            parent_path, inst_name = spec.dst_path.rsplit('/', 1)
+            parent = db.module_at(parent_path)
+            inst   = parent.instances.get(inst_name) if parent else None
+            conn   = inst.connections.get(spec.dst_port) if inst else ''
+            if conn:
+                print(col(f'  WARN row {r}: {where} is already connected to '
+                          f'"{conn}"; that connection will be replaced', C.YELLOW))
+
     if validation_errors:
         print(col('\n  PATH VALIDATION ERRORS:', C.RED, C.BOLD))
         for e in validation_errors: print(col(e, C.RED))
@@ -1542,9 +1630,21 @@ ENDPOINT FORMAT
     cs         = ChangeSet()
     warn_msgs: List[str] = []
     mismatches: List[MismatchInfo] = []
+    conflicts: List[str] = []
 
+    # Each row is planned on its own and checked against the pristine RTL and
+    # the rows before it, so a collision is reported per row.
     for spec in conns:
-        plan_connection(db, spec, cs, warn_msgs, mismatches)
+        row = ChangeSet()
+        plan_connection(db, spec, row, warn_msgs, mismatches, claimed=cs)
+        conflicts += plan_conflicts(db, row, cs, spec)
+        cs.merge(row)
+
+    if conflicts:
+        print(col('\n  NAME CONFLICTS:', C.RED, C.BOLD))
+        for e in conflicts: print(col(f'  {e}', C.RED))
+        print(col('  No files written.', C.RED))
+        sys.exit(1)
 
     # ── Print plan summary ────────────────────────────────────────────────────
     print_plan_summary(conns, cs, mismatches, db)
@@ -1561,11 +1661,23 @@ ENDPOINT FORMAT
         print(col('  No files written.', C.RED))
         sys.exit(1)
 
+    planned = {db.modules[mn].filepath for mn in cs.all_modules() if mn in db.modules}
+    cleanup = [fp for fp in outputs if fp not in planned]
+    if not outputs:
+        print(col('\n  Nothing to do: no connections and no AUTO_WIRE content '
+                  'to remove.', C.YELLOW))
+        sys.exit(0)
+    if cleanup:
+        print(col(f'\n  Will remove stale AUTO_WIRE content from {len(cleanup)} '
+                  f'file(s):', C.BOLD))
+        for fp in cleanup: print(f'    {col(fp, C.DIM)}')
+
     # ── Confirm before writing ────────────────────────────────────────────────
     if not args.dry_run:
         print(f'\n  {hr()}')
         affected = sorted(cs.all_modules().keys())
-        print(col(f'  Will modify {len(affected)} module(s):', C.BOLD))
+        if affected:
+            print(col(f'  Will modify {len(affected)} module(s):', C.BOLD))
         for mn in affected:
             fp = db.modules[mn].filepath if mn in db.modules else col('? not in DB', C.RED)
             print(f'    {col(mn, C.WHITE):<28} {col(fp, C.DIM)}')
@@ -1576,7 +1688,7 @@ ENDPOINT FORMAT
         except (EOFError, KeyboardInterrupt):
             ans = 'n'
 
-        if ans == 'n':
+        if ans not in ('', 'y', 'yes'):
             print(col('  Aborted. No files written.', C.YELLOW))
             sys.exit(0)
 

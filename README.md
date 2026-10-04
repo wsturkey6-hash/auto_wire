@@ -17,6 +17,9 @@ marked, idempotent `// AUTO_WIRE_BEGIN … // AUTO_WIRE_END` blocks.
    the destination, inserting ports/wires/assigns/connections at each level.
 4. **Write back** the edits idempotently — re-running reproduces the same
    result, because the tool strips its own previous output first.
+   Each run makes the scanned RTL match the CSV: output from earlier runs that
+   the CSV no longer asks for is removed from every scanned file, so keep all
+   of a design's connections in one CSV.
 
 ## Install
 ```
@@ -50,6 +53,11 @@ w_bus,8,TOP/u_a.out,TOP/u_b.in,8-bit bus
   instance name. Top-level signals use just the top name: `TOP.my_clk`.
 - A **source** signal must already exist — a missing source is a fatal error.
   Missing **destination** ports are created by the tool.
+- A destination is an input of the instance named by its path or, when the
+  route ends in a module's own scope (e.g. `TOP.dbg_out`), an output of that
+  module, which the tool drives. Each destination takes one source, and a
+  wire_name must not collide with an existing signal; violations are reported
+  before anything is written.
 
 See [`example_connections.csv`](example_connections.csv) for a worked example.
 

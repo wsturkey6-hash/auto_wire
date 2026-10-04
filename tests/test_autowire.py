@@ -79,14 +79,14 @@ def write_fixture_nonansi(d: Path):
     """), newline="\n")
 
 
-def run_tool(rtldir, csvpath, top="top", extra=()):
+def run_tool(rtldir, csvpath, top="top", extra=(), answer="y\n", cwd=None):
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     return subprocess.run(
         [sys.executable, AUTOWIRE, "-d", str(rtldir), "-T", top,
          "-c", str(csvpath), "--no-color", *extra],
-        input="y\n", capture_output=True, text=True,
-        encoding="utf-8", errors="replace", env=env,
+        input=answer, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env, cwd=cwd,
     )
 
 
@@ -345,6 +345,19 @@ class _TmpRTL(unittest.TestCase):
         for name, text in read_all(self.rtl).items():
             self.assertIsNone(SELF_ASSIGN.search(text), f"self-assign in {name}")
 
+    def snapshot(self):
+        return {p.name: p.read_bytes() for p in sorted(self.rtl.glob("*.v"))}
+
+    def assertRejected(self, csv, *needles):
+        """The run fails before writing anything and mentions every needle."""
+        before = self.snapshot()
+        r = run_tool(self.rtl, csv)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        for needle in needles:
+            self.assertIn(needle, out)
+        self.assertEqual(before, self.snapshot(), "files were modified")
+
 
 class DeepSourceTests(_TmpRTL):
     """Item 1: a source two levels below the LCA is routed up through mid."""
@@ -592,6 +605,319 @@ class EncodingTests(_TmpRTL):
     def test_crlf_preserved(self):
         data = self._run(newline="\r\n")
         self.assertEqual(data.count(b"\n"), data.count(b"\r\n"))
+
+
+# ── regression cases from the 2026-10 review (items 7–13) ────────────────────
+LEAF_Q = """\
+    module leaf (input clk, output [7:0] q);
+        assign q = 8'h5a;
+    endmodule
+"""
+MID_LEAF = """\
+    module mid (input clk);
+        leaf u_leaf (.clk(clk));
+    endmodule
+"""
+
+
+class NameConflictTests(_TmpRTL):
+    """Item 7: a crossing-wire name must not collide with existing signals."""
+    def test_wire_name_exists_in_lca(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {"top.v": """\
+            module top (
+                input        clk,
+                input  [7:0] data_in
+            );
+                wire [7:0] w_data = data_in;
+                mid u_mid (.clk(clk));
+            endmodule
+        """})
+        self.assertRejected(write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"),
+                            "already exists")
+
+    def test_wire_name_exists_in_intermediate(self):
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (input clk);
+                endmodule
+            """,
+            "mid.v": """\
+                module mid (input clk, input [7:0] w_data);
+                    leaf u_leaf (.clk(clk));
+                endmodule
+            """,
+            "top.v": """\
+                module top (input clk, input [7:0] data_in, input [7:0] other);
+                    mid u_mid (.clk(clk), .w_data(other));
+                endmodule
+            """})
+        self.assertRejected(write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"),
+                            "already exists")
+
+    def test_wire_name_equals_lca_dst_port(self):
+        write_files(self.rtl, {"leaf.v": LEAF_Q, "mid.v": MID_LEAF, "top.v": """\
+            module top (input clk);
+                mid u_mid (.clk(clk));
+            endmodule
+        """})
+        self.assertRejected(write_csv(self.rtl, "busy_tap,8,top/u_mid/u_leaf.q,top.busy_tap,x"),
+                            "busy_tap")
+
+    def test_module_on_both_sides_of_route(self):
+        write_files(self.rtl, {
+            "leaf.v": LEAF_Q,
+            "blk.v": """\
+                module blk (input clk);
+                    leaf u_leaf (.clk(clk));
+                endmodule
+            """,
+            "top.v": """\
+                module top (input clk);
+                    blk u_a (.clk(clk));
+                    blk u_b (.clk(clk));
+                endmodule
+            """})
+        self.assertRejected(write_csv(self.rtl, "w_x,8,top/u_a/u_leaf.q,top/u_b/u_leaf.d,x"),
+                            "conflicting")
+
+    def test_fan_out_from_unconnected_output(self):
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (input [7:0] d, output [7:0] q);
+                    assign q = d;
+                endmodule
+            """,
+            "sink.v": """\
+                module sink (input [7:0] x, output [7:0] y);
+                    assign y = x;
+                endmodule
+            """,
+            "top.v": """\
+                module top (input [7:0] d, output [7:0] y1, output [7:0] y2);
+                    leaf u_leaf (.d(d));
+                    sink u_s1 (.y(y1));
+                    sink u_s2 (.y(y2));
+                endmodule
+            """})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_a,8,top/u_leaf.q,top/u_s1.x,first",
+                                         "w_b,8,top/u_leaf.q,top/u_s2.x,second"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(read_all(self.rtl)["leaf.v"], r"assign\s+w_b\s*=\s*q\s*;")
+        self.assertClean()
+        if IVERILOG and VVP:
+            lines = simulate(self.rtl, """\
+                module tb;
+                    reg  [7:0] d;
+                    wire [7:0] y1, y2;
+                    top dut (.d(d), .y1(y1), .y2(y2));
+                    initial begin
+                        d = 8'h69; #1 $display("@ %h %h %h", d, y1, y2);
+                    end
+                endmodule
+            """)
+            self.assertEqual(lines, ["@ 69 69 69"])
+
+
+class DestinationTests(_TmpRTL):
+    """Items 8 and 9: what may be a destination, and only once."""
+    TOP = """\
+        module top (input clk, input [7:0] data_in, input [7:0] other);
+            mid u_mid (.clk(clk));
+        endmodule
+    """
+
+    def test_dst_output_rejected(self):
+        write_files(self.rtl, {"leaf.v": LEAF_Q, "mid.v": MID_LEAF, "top.v": self.TOP})
+        self.assertRejected(write_csv(self.rtl, "w_d,8,top.data_in,top/u_mid/u_leaf.q,x"),
+                            "output")
+
+    def test_lca_scope_input_rejected(self):
+        write_files(self.rtl, {"leaf.v": LEAF_Q, "mid.v": MID_LEAF, "top.v": self.TOP})
+        self.assertRejected(write_csv(self.rtl, "w_q,8,top/u_mid/u_leaf.q,top.other,x"),
+                            "input")
+
+    def test_dst_internal_signal_rejected(self):
+        write_files(self.rtl, {"leaf.v": """\
+            module leaf (input clk);
+                wire [7:0] sink_in;
+            endmodule
+        """, "mid.v": MID_LEAF, "top.v": self.TOP})
+        self.assertRejected(write_csv(self.rtl, "w_d,8,top.data_in,top/u_mid/u_leaf.sink_in,x"),
+                            "not a port")
+
+    def test_connected_dst_warns_and_rewires(self):
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (input clk, input [7:0] d);
+                endmodule
+            """,
+            "mid.v": """\
+                module mid (input clk, input [7:0] old);
+                    leaf u_leaf (.clk(clk), .d(old));
+                endmodule
+            """,
+            "top.v": """\
+                module top (input clk, input [7:0] data_in, input [7:0] other);
+                    mid u_mid (.clk(clk), .old(other));
+                endmodule
+            """})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_d,8,top.data_in,top/u_mid/u_leaf.d,x"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("already connected", r.stdout)
+        self.assertClean()
+
+    def test_duplicate_dst_rejected(self):
+        write_fixture(self.rtl)
+        self.assertRejected(write_csv(self.rtl,
+                                      "w_a,8,top.data_in,top/u_mid/u_leaf.sink_in,a",
+                                      "w_b,8,top.data_in,top/u_mid/u_leaf.sink_in,b"),
+                            "Row 3", "row 2")
+
+
+class SameScopeTests(_TmpRTL):
+    """Item 10: src and dst in the same module."""
+    def test_same_scope_creates_driven_output(self):
+        write_fixture(self.rtl)
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_dbg,8,top.data_in,top.dbg_out,x"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(read_all(self.rtl)["top.v"], r"output\s+wire\s+\[7:0\]\s+dbg_out")
+        self.assertClean()
+        if IVERILOG and VVP:
+            lines = simulate(self.rtl, """\
+                module tb;
+                    reg clk = 0; reg [7:0] data_in;
+                    wire [7:0] dbg_out;
+                    top dut (.clk(clk), .data_in(data_in), .dbg_out(dbg_out));
+                    initial begin
+                        data_in = 8'h3c; #1 $display("@ %h %h", data_in, dbg_out);
+                    end
+                endmodule
+            """)
+            self.assertEqual(lines, ["@ 3c 3c"])
+
+    def test_same_endpoint_rejected(self):
+        write_fixture(self.rtl)
+        self.assertRejected(write_csv(self.rtl, "w_x,8,top.data_in,top.data_in,x"),
+                            "same signal")
+
+
+class AdapterPlacementTests(_TmpRTL):
+    """Item 11: a width adapter for a dst in the LCA's own scope."""
+    def test_adapter_in_lca_scope(self):
+        write_files(self.rtl, {
+            "leaf.v": """\
+                module leaf (input clk, output [7:0] q);
+                    assign q = 8'ha5;
+                endmodule
+            """,
+            "mid.v": """\
+                module mid (input clk, output [15:0] y16);
+                    leaf u_leaf (.clk(clk));
+                endmodule
+            """,
+            "top.v": """\
+                module top (input clk, output [15:0] y16);
+                    mid u_mid (.clk(clk), .y16(y16));
+                endmodule
+            """})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_q,8,top/u_mid/u_leaf.q,top/u_mid.y16,8b to 16b"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertClean()
+        if IVERILOG and VVP:
+            lines = simulate(self.rtl, """\
+                module tb;
+                    reg clk = 0;
+                    wire [15:0] y16;
+                    top dut (.clk(clk), .y16(y16));
+                    initial #1 $display("@ %h", y16);
+                endmodule
+            """)
+            self.assertEqual(lines, ["@ 00a5"])
+
+
+class ReconcileTests(_TmpRTL):
+    """Item 12: every run makes the scanned RTL match the CSV."""
+    ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
+
+    def test_removed_row_leaves_no_residue(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {
+            "sub.v": """\
+                module sub (input clk);
+                endmodule
+            """,
+            "side.v": """\
+                module side (input clk, input [3:0] s);
+                    sub u_sub (.clk(clk));
+                endmodule
+            """,
+            "top.v": """\
+                module top (
+                    input        clk,
+                    input  [7:0] data_in,
+                    input  [3:0] s
+                );
+                    mid u_mid (.clk(clk));
+                    side u_side (.clk(clk), .s(s));
+                endmodule
+            """})
+        original = self.snapshot()
+        self.assertEqual(run_tool(self.rtl, write_csv(self.rtl, self.ROW)).returncode, 0)
+        # The new CSV only touches side.v and sub.v.
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_s,4,top/u_side.s,top/u_side/u_sub.s_in,x"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        now = self.snapshot()
+        for name in ("top.v", "mid.v", "leaf.v"):
+            self.assertEqual(now[name], original[name], name)
+        self.assertClean()
+
+    def test_empty_csv_removes_all_tool_content(self):
+        write_fixture(self.rtl)
+        original = self.snapshot()
+        self.assertEqual(run_tool(self.rtl, write_csv(self.rtl, self.ROW)).returncode, 0)
+        self.assertNotEqual(original, self.snapshot())
+        r = run_tool(self.rtl, write_csv(self.rtl))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(original, self.snapshot())
+
+    def test_absolute_rtl_dir_rerun_is_idempotent(self):
+        # With the cwd on the same drive, pyslang reports file paths relative
+        # to it; they must still map to the files scan_dir keyed by -d.
+        write_fixture(self.rtl)
+        csv = write_csv(self.rtl, self.ROW)
+        self.assertEqual(run_tool(self.rtl, csv, cwd=self.rtl).returncode, 0)
+        first = self.snapshot()
+        self.assertIn(b"sink_in", first["leaf.v"])
+        r = run_tool(self.rtl, csv, cwd=self.rtl)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(first, self.snapshot(), "second run changed the files")
+
+    def test_empty_csv_on_clean_tree_is_noop(self):        # guard
+        write_fixture(self.rtl)
+        original = self.snapshot()
+        r = run_tool(self.rtl, write_csv(self.rtl))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Nothing to do", r.stdout)
+        self.assertEqual(original, self.snapshot())
+
+
+class PromptTests(_TmpRTL):
+    """Item 13: only Enter / y / yes proceeds."""
+    ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
+
+    def test_no_aborts(self):
+        write_fixture(self.rtl)
+        original = self.snapshot()
+        r = run_tool(self.rtl, write_csv(self.rtl, self.ROW), answer="no\n")
+        self.assertIn("Aborted", r.stdout)
+        self.assertEqual(original, self.snapshot())
+
+    def test_yes_proceeds(self):                           # guard
+        write_fixture(self.rtl)
+        r = run_tool(self.rtl, write_csv(self.rtl, self.ROW), answer="yes\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("sink_in", read_all(self.rtl)["leaf.v"])
 
 
 # ── optional external-linter cross-check ─────────────────────────────────────
