@@ -1175,19 +1175,27 @@ def _insert_inst_connections(source: str, inst_name: str,
     conn_text = source[open_pos+1:end]
     # `.port(sig)`, or an SV implicit `.port` with no parentheses
     conn_re = re.compile(r'\.\s*(\w+)(?:\s*\(\s*([^)]*?)\s*\))?', re.MULTILINE)
+    # Matched in the comment-masked text, so a `.port(...)` inside a comment
+    # is neither counted nor rewritten and a `)` inside a comment doesn't end
+    # a connection; each span is the same in conn_text.
+    conns = list(conn_re.finditer(masked[open_pos+1:end]))
 
-    existing_ports = set(m.group(1) for m in conn_re.finditer(conn_text))
+    existing_ports = set(m.group(1) for m in conns)
 
     def _repl(m):
-        pname = m.group(1)
+        pname, orig = m.group(1), conn_text[m.start():m.end()]
         if pname in new_conns:
-            if _ORIG_CLOSE in m.group(0):
-                raise WriteBackError(f'cannot rewrite "{m.group(0)}" of "{inst_name}"')
+            if _ORIG_CLOSE in orig:
+                raise WriteBackError(f'cannot rewrite "{orig}" of "{inst_name}"')
             return (f'.{pname} ( {new_conns[pname]} ) '
-                    f'{_ORIG_OPEN}{m.group(0)}{_ORIG_CLOSE}')
-        return m.group(0)
+                    f'{_ORIG_OPEN}{orig}{_ORIG_CLOSE}')
+        return orig
 
-    new_conn_text = conn_re.sub(_repl, conn_text)
+    new_conn_text, last = '', 0
+    for m in conns:
+        new_conn_text += conn_text[last:m.start()] + _repl(m)
+        last = m.end()
+    new_conn_text += conn_text[last:]
 
     missing = [p for p in new_conns.keys() if p not in existing_ports]
     if missing:

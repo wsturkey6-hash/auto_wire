@@ -1038,6 +1038,55 @@ class ConnectionTailTests(_TmpRTL):
         self._run_and_clean()
 
 
+class CommentedConnectionTests(_TmpRTL):
+    """A `.port(...)` inside a comment is not a connection: the tool neither
+    counts nor rewrites it, and a `)` inside a comment doesn't end one."""
+    ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
+
+    def _check(self, *conns, rewire=False):
+        write_fixture(self.rtl)
+        if rewire:                           # sink_in exists, wired to real_sig
+            write_files(self.rtl, {"leaf.v": """\
+                module leaf (
+                    input       clk,
+                    input [7:0] sink_in
+                );
+                endmodule
+            """})
+        (self.rtl / "mid.v").write_text(
+            "module mid (\n    input clk\n);\n    wire [7:0] real_sig;\n"
+            "    leaf u_leaf (\n" + "".join(f"        {c}\n" for c in conns)
+            + "    );\nendmodule\n", newline="\n")
+        original = self.snapshot()
+        r = run_tool(self.rtl, write_csv(self.rtl, self.ROW))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertClean()
+        mid = read_all(self.rtl)["mid.v"]
+        self.assertRegex(aw._mask_comments(mid), r"\.sink_in\s*\(\s*w_data\s*\)")
+        # Only a real connection is rewritten, never a comment.
+        self.assertEqual(mid.count(aw._ORIG_OPEN), int(rewire), mid)
+        r = run_tool(self.rtl, write_csv(self.rtl))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(original, self.snapshot())
+
+    def test_commented_out_connection_mid_list(self):
+        self._check("// .sink_in (old)", ".clk (clk)")
+
+    def test_commented_out_connection_last(self):          # guard
+        self._check(".clk (clk)", "// .sink_in (old)")
+
+    def test_block_commented_connection(self):
+        self._check("/* .sink_in (old) */", ".clk (clk)")
+
+    def test_rewire_leaves_commented_copy(self):
+        self._check(".sink_in (real_sig),   // was .sink_in (old)", ".clk (clk)",
+                    rewire=True)
+
+    def test_paren_in_comment_inside_connection(self):
+        self._check(".sink_in (real_sig  // see f(x)", "),", ".clk (clk)",
+                    rewire=True)
+
+
 class PromptTests(_TmpRTL):
     """Item 13: only Enter / y / yes proceeds."""
     ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
