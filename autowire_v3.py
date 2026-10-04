@@ -231,12 +231,13 @@ class RTLDatabase:
         Concrete module/hierarchy extraction happens in build_hierarchy (needs
         elaboration). When `top` is given, elaboration is constrained to that
         module so a large tree of incidental top-level modules (testbenches,
-        unused) isn't built. Every file's pristine text is registered before
-        anything is parsed, so an `include of a scanned file sees it without
-        the tool's earlier output."""
+        unused) isn't built. Every file's pristine text, *.vh / *.svh headers
+        included, is registered before anything is parsed, so an `include of
+        a scanned file sees it without the tool's earlier output."""
         files = sorted({*Path(rtl_dir).rglob('*.v'), *Path(rtl_dir).rglob('*.sv')})
         if not files:
             return 0
+        headers = sorted({*Path(rtl_dir).rglob('*.vh'), *Path(rtl_dir).rglob('*.svh')})
         self._sm = pyslang.SourceManager()
         # Make every directory that contains RTL an include search path so
         # `include "..."` resolves wherever the header lives.
@@ -250,7 +251,7 @@ class RTLDatabase:
             self._comp = Compilation(bag)
         else:
             self._comp = Compilation()
-        for f in files:
+        for f in files + headers:
             try:
                 raw, enc, orig = _read_rtl(f)
             except Exception as e:
@@ -269,16 +270,20 @@ class RTLDatabase:
         # Register every file's pristine text under its absolute path before
         # parsing anything: an `include of a scanned file then resolves to that
         # text (not the file on disk, which may hold earlier tool output), and
-        # no file is ever loaded twice. Each file is still compiled as its own
-        # unit; slang ignores a definition it meets again at the same source
-        # location through an include.
+        # no file is ever loaded twice. Each .v/.sv file is still compiled as
+        # its own unit; slang ignores a definition it meets again at the same
+        # source location through an include. A header is compiled only where
+        # it is included, since it may be a fragment that doesn't parse alone.
         buffers = {}
         for fp, clean in self._sources.items():
             try:
                 buffers[fp] = self._sm.assignText(os.path.abspath(fp), clean)
             except Exception as e:
                 self.errors.append(f'parse error in {fp}: {e}')
+        units = {str(f) for f in files}
         for fp, buf in buffers.items():
+            if fp not in units:
+                continue
             try:
                 self._comp.addSyntaxTree(SyntaxTree.fromBuffer(buf, self._sm))
             except Exception as e:
@@ -1157,12 +1162,17 @@ def _insert_inst_connections(source: str, inst_name: str,
     if not found:
         raise WriteBackError(f'cannot locate the instantiation of "{inst_name}"')
     _, open_pos, close_pos = found           # positions valid for source too
+    # The connections end at the last character outside whitespace and
+    # comments. What follows them (a `);` on its own line, a trailing comment)
+    # stays after anything added, so a strip restores it exactly and an added
+    # comma never lands inside a comment.
+    end = open_pos + 1 + len(masked[open_pos+1:close_pos].rstrip())
 
     # Replace any existing .port(...) entries for ports we are updating,
     # and append any missing connections (keeping the inline-stamp format
     # for later idempotent removal). A replaced entry keeps its original
     # text in an aw-orig marker so the strip can restore it.
-    conn_text = source[open_pos+1:close_pos]
+    conn_text = source[open_pos+1:end]
     # `.port(sig)`, or an SV implicit `.port` with no parentheses
     conn_re = re.compile(r'\.\s*(\w+)(?:\s*\(\s*([^)]*?)\s*\))?', re.MULTILINE)
 
@@ -1188,9 +1198,9 @@ def _insert_inst_connections(source: str, inst_name: str,
         stamp = _inline_stamp(user)
         parts = [f',  {stamp}\n    .{p:<40} ( {new_conns[p]} )' for p in missing]
         additions = ''.join(parts)
-        new_conn_text = new_conn_text.rstrip() + additions
+        new_conn_text += additions
 
-    return source[:open_pos+1] + new_conn_text + source[close_pos:]
+    return source[:open_pos+1] + new_conn_text + source[end:]
 
 def _add_ports_to_header(source: str, mod_name: str,
                          port_decls: List[Tuple[str, str, str]],

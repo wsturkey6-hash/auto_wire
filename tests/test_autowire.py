@@ -986,6 +986,58 @@ class ReconcileTests(_TmpRTL):
         self.assertEqual(original, self.snapshot())
 
 
+class ConnectionTailTests(_TmpRTL):
+    """What follows an instance's last connection, e.g. a `);` on its own line
+    or a trailing comment, stays after the connections the tool adds."""
+    ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
+
+    def _run_and_clean(self):
+        original = self.snapshot()
+        r = run_tool(self.rtl, write_csv(self.rtl, self.ROW))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertClean()
+        r = run_tool(self.rtl, write_csv(self.rtl))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(original, self.snapshot())
+
+    def test_own_line_close_paren_restored(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {
+            "mid.v": """\
+                module mid (
+                    input clk
+                );
+                    leaf u_leaf (
+                        .clk (clk)
+                    );
+                endmodule
+            """,
+            "top.v": """\
+                module top (
+                    input        clk,
+                    input  [7:0] data_in
+                );
+                    mid u_mid (
+                        .clk (clk)
+                    );
+                endmodule
+            """})
+        self._run_and_clean()
+
+    def test_trailing_comment_after_last_connection(self):
+        write_fixture(self.rtl)
+        write_files(self.rtl, {"mid.v": """\
+            module mid (
+                input clk
+            );
+                leaf u_leaf (
+                    .clk (clk)   // the clock
+                );
+            endmodule
+        """})
+        self._run_and_clean()
+
+
 class PromptTests(_TmpRTL):
     """Item 13: only Enter / y / yes proceeds."""
     ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
@@ -1154,15 +1206,15 @@ class IncludeTests(_TmpRTL):
             """})
         return write_csv(self.rtl, ROW_DOWN)
 
-    def _module_design(self):
+    def _module_design(self, name="sub.v"):
         write_fixture(self.rtl)
         write_files(self.rtl, {
-            "sub.v": """\
+            name: """\
                 module sub (input clk);
                 endmodule
             """,
-            "top.v": """\
-                `include "sub.v"
+            "top.v": f"""\
+                `include "{name}"
                 module top (
                     input        clk,
                     input  [7:0] data_in
@@ -1219,6 +1271,24 @@ class IncludeTests(_TmpRTL):
                 endmodule
             """})
         self._check_reruns(write_csv(self.rtl, "w_s,8,top.data_in,top/u_sub.s_in,x"))
+
+    def _check_header_module(self, header):
+        # A header isn't compiled on its own, but a module in it is edited like
+        # any other: the include must see it without the tool's earlier output.
+        self._module_design(header)
+        original, pristine = self.snapshot(), (self.rtl / header).read_bytes()
+        self._check_reruns(write_csv(self.rtl, "w_s,8,top.data_in,top/u_sub.s_in,x"))
+        self.assertIn(b"s_in", (self.rtl / header).read_bytes())
+        r = run_tool(self.rtl, write_csv(self.rtl))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(original, self.snapshot())
+        self.assertEqual(pristine, (self.rtl / header).read_bytes())
+
+    def test_module_in_vh_header_can_be_edited(self):
+        self._check_header_module("sub.vh")
+
+    def test_module_in_svh_header_can_be_edited(self):
+        self._check_header_module("sub.svh")
 
 
 class SampleTests(_TmpRTL):

@@ -7,7 +7,8 @@ every level — and writes the changes back into the `.v` files inside clearly
 marked, idempotent `// AUTO_WIRE_BEGIN … // AUTO_WIRE_END` blocks.
 
 ## How it works
-1. **Parse** all `.v` and `.sv` files with [pyslang](https://github.com/MikePopoloski/slang)
+1. **Parse** all `.v` and `.sv` files, and the `.vh` / `.svh` headers they
+   include, with [pyslang](https://github.com/MikePopoloski/slang)
    (a real SystemVerilog/Verilog frontend) — accurate ports, directions, and
    concrete (parameter-resolved) bit widths.
 2. **Elaborate** the design from the given top module to build the instance
@@ -27,7 +28,7 @@ marked, idempotent `// AUTO_WIRE_BEGIN … // AUTO_WIRE_END` blocks.
 ```
 pip install -r requirements.txt
 ```
-Requires Python 3 and `pyslang` (tested with 11.x). Optionally install Icarus Verilog (`iverilog`)
+Requires Python 3 and `pyslang` (tested with 11.x and 12.x). Optionally install Icarus Verilog (`iverilog`)
 or Verilator to enable the test suite's external elaboration/lint cross-check,
 and `openpyxl` if your connection list is an `.xlsx` file.
 
