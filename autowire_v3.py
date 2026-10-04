@@ -1023,7 +1023,9 @@ def _inline_stamp(user: str) -> str:
 
 def _mask_comments(text: str) -> str:
     """
-    Return a copy of text with comment CONTENT replaced by spaces.
+    Return a copy of text with the CONTENT of comments and string literals
+    replaced by spaces (a string keeps its quotes), so nothing inside them is
+    taken for code: no parenthesis, `//`, `/*` or keyword.
     Length is preserved → positions in masked string == positions in original.
     """
     result = list(text)
@@ -1039,6 +1041,18 @@ def _mask_comments(text: str) -> str:
             end = (j + 2) if j >= 0 else len(text)
             for k in range(i, end): result[k] = ' '
             i = end
+        elif text[i] == '"':
+            # A string ends at the next unescaped quote; a backslash escapes
+            # the character after it. An unterminated string ends at the line.
+            j = i + 1
+            while j < len(text) and text[j] not in '"\n':
+                j += 2 if text[j] == '\\' else 1
+            for k in range(i + 1, min(j, len(text))): result[k] = ' '
+            i = j + 1
+        elif text[i] == '\\':
+            # An escaped identifier runs to the next whitespace; a quote or
+            # `//` inside it starts nothing.
+            while i < len(text) and not text[i].isspace(): i += 1
         else:
             i += 1
     return ''.join(result)

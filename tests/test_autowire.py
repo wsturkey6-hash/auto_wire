@@ -146,6 +146,23 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(conns[0].bit_width, 8)
             self.assertEqual(conns[1].wire_name, "w_q_to_r")  # auto-generated
 
+    def test_mask_comments_and_strings(self):
+        m = aw._mask_comments
+        # A string's contents are blanked, its quotes kept; nothing inside it
+        # starts a comment.
+        self.assertEqual(m('.a ("(//)") // c'), '.a ("    ")     ')
+        self.assertEqual(m('"/*" (x) "*/"'), '"  " (x) "  "')
+        # Escaped quote, escaped backslash, backslash-newline continuation.
+        self.assertEqual(m('"a\\"b" ('), '"    " (')
+        self.assertEqual(m('"a\\\\" )'), '"   " )')
+        self.assertEqual(m('"a\\\nb" )'), '"    " )')
+        # An unterminated string ends at the line.
+        self.assertEqual(m('"ab\n(c)'), '"  \n(c)')
+        # A quote inside a comment, or a quote or `//` inside an escaped
+        # identifier, starts nothing.
+        self.assertEqual(m('/* " */ (x)'), '        (x)')
+        self.assertEqual(m('\\a"b//c (x)'), '\\a"b//c (x)')
+
 
 # ── end-to-end tests ─────────────────────────────────────────────────────────
 class _E2EBase:
@@ -1041,10 +1058,11 @@ class ConnectionTailTests(_TmpRTL):
 class _ConnListBase(_TmpRTL):
     """Routes top.data_in to sink_in of u_leaf, whose connection list in mid.v
     is given line by line. With rewire, sink_in already exists and is wired
-    to real_sig, so the tool rewrites that connection."""
+    to real_sig, so the tool rewrites that connection. body holds lines of
+    mid before the instance; prefix is text before `module mid`."""
     ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
 
-    def _design(self, *conns, rewire=False):
+    def _design(self, *conns, rewire=False, body=(), prefix=""):
         write_fixture(self.rtl)
         if rewire:                           # sink_in exists, wired to real_sig
             write_files(self.rtl, {"leaf.v": """\
@@ -1055,12 +1073,13 @@ class _ConnListBase(_TmpRTL):
                 endmodule
             """})
         (self.rtl / "mid.v").write_text(
-            "module mid (\n    input clk\n);\n    wire [7:0] real_sig;\n"
-            "    leaf u_leaf (\n" + "".join(f"        {c}\n" for c in conns)
+            prefix + "module mid (\n    input clk\n);\n    wire [7:0] real_sig;\n"
+            + "".join(f"    {b}\n" for b in body)
+            + "    leaf u_leaf (\n" + "".join(f"        {c}\n" for c in conns)
             + "    );\nendmodule\n", newline="\n")
 
-    def _check(self, *conns, rewire=False):
-        self._design(*conns, rewire=rewire)
+    def _check(self, *conns, rewire=False, **design):
+        self._design(*conns, rewire=rewire, **design)
         original = self.snapshot()
         r = run_tool(self.rtl, write_csv(self.rtl, self.ROW))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1120,6 +1139,40 @@ class NestedParenTests(_ConnListBase):
     def test_block_comment_rewire_refused(self):           # guard
         self._design(".sink_in (real_sig /* ) */ ),", ".clk (clk)", rewire=True)
         self.assertRejected(write_csv(self.rtl, self.ROW), "WRITE-BACK ERROR")
+
+
+class StringLiteralTests(_ConnListBase):
+    """Nothing inside a string literal is taken for code: no parenthesis,
+    comment opener, `module`, `endmodule` or instance name. (A string on
+    the 1-bit clk input is only truncated.)"""
+
+    def test_open_paren_in_rewired_string(self):
+        self._check(".clk (clk),", '.sink_in ("(")', rewire=True)
+
+    def test_close_paren_in_rewired_string(self):
+        self._check(".clk (clk),", '.sink_in ("a)")', rewire=True)
+
+    def test_paren_in_string_beside_new_connection(self):
+        self._check('.clk ("(")')
+
+    def test_slashes_in_string(self):
+        self._check('.clk ("a//b")')
+
+    def test_block_comment_opener_in_string(self):
+        self._check('.clk ("/*")')
+
+    def test_module_name_in_string(self):
+        self._check(".clk (clk)", prefix='module helper;\n'
+                    '    initial $display("module mid");\nendmodule\n\n')
+
+    def test_endmodule_in_string(self):
+        self._check(".clk (clk)", body=['initial $display("endmodule");'])
+
+    def test_instance_in_string(self):
+        self._check(".clk (clk)", body=['initial $display("leaf u_leaf (");'])
+
+    def test_plain_string(self):                           # guard
+        self._check('.clk ("ab")')
 
 
 class PromptTests(_TmpRTL):
