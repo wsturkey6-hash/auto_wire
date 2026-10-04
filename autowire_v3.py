@@ -1173,17 +1173,25 @@ def _insert_inst_connections(source: str, inst_name: str,
     # for later idempotent removal). A replaced entry keeps its original
     # text in an aw-orig marker so the strip can restore it.
     conn_text = source[open_pos+1:end]
-    # `.port(sig)`, or an SV implicit `.port` with no parentheses
-    conn_re = re.compile(r'\.\s*(\w+)(?:\s*\(\s*([^)]*?)\s*\))?', re.MULTILINE)
-    # Matched in the comment-masked text, so a `.port(...)` inside a comment
-    # is neither counted nor rewritten and a `)` inside a comment doesn't end
-    # a connection; each span is the same in conn_text.
-    conns = list(conn_re.finditer(masked[open_pos+1:end]))
+    # Each connection is `.port(...)` up to its balanced `)`, or an SV
+    # implicit `.port` with no parentheses. It is found in the comment-masked
+    # text, so a `.port(...)` inside a comment is neither counted nor
+    # rewritten, and neither a `)` inside a comment nor a nested `(...)` ends
+    # a connection; positions are the same in conn_text.
+    mconn = masked[open_pos+1:end]
+    port_re = re.compile(r'\.\s*(\w+)')
+    conns, i = [], 0                         # (port, start, stop)
+    while True:
+        m = port_re.search(mconn, i)
+        if not m:
+            break
+        j = _skip_ws(mconn, m.end())
+        i = _find_balanced(mconn, j) + 1 if mconn.startswith('(', j) else m.end()
+        conns.append((m.group(1), m.start(), i))
 
-    existing_ports = set(m.group(1) for m in conns)
+    existing_ports = set(p for p, _, _ in conns)
 
-    def _repl(m):
-        pname, orig = m.group(1), conn_text[m.start():m.end()]
+    def _repl(pname, orig):
         if pname in new_conns:
             if _ORIG_CLOSE in orig:
                 raise WriteBackError(f'cannot rewrite "{orig}" of "{inst_name}"')
@@ -1192,9 +1200,9 @@ def _insert_inst_connections(source: str, inst_name: str,
         return orig
 
     new_conn_text, last = '', 0
-    for m in conns:
-        new_conn_text += conn_text[last:m.start()] + _repl(m)
-        last = m.end()
+    for pname, start, stop in conns:
+        new_conn_text += conn_text[last:start] + _repl(pname, conn_text[start:stop])
+        last = stop
     new_conn_text += conn_text[last:]
 
     missing = [p for p in new_conns.keys() if p not in existing_ports]

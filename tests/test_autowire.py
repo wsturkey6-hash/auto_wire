@@ -1038,12 +1038,13 @@ class ConnectionTailTests(_TmpRTL):
         self._run_and_clean()
 
 
-class CommentedConnectionTests(_TmpRTL):
-    """A `.port(...)` inside a comment is not a connection: the tool neither
-    counts nor rewrites it, and a `)` inside a comment doesn't end one."""
+class _ConnListBase(_TmpRTL):
+    """Routes top.data_in to sink_in of u_leaf, whose connection list in mid.v
+    is given line by line. With rewire, sink_in already exists and is wired
+    to real_sig, so the tool rewrites that connection."""
     ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,x"
 
-    def _check(self, *conns, rewire=False):
+    def _design(self, *conns, rewire=False):
         write_fixture(self.rtl)
         if rewire:                           # sink_in exists, wired to real_sig
             write_files(self.rtl, {"leaf.v": """\
@@ -1057,6 +1058,9 @@ class CommentedConnectionTests(_TmpRTL):
             "module mid (\n    input clk\n);\n    wire [7:0] real_sig;\n"
             "    leaf u_leaf (\n" + "".join(f"        {c}\n" for c in conns)
             + "    );\nendmodule\n", newline="\n")
+
+    def _check(self, *conns, rewire=False):
+        self._design(*conns, rewire=rewire)
         original = self.snapshot()
         r = run_tool(self.rtl, write_csv(self.rtl, self.ROW))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1068,6 +1072,11 @@ class CommentedConnectionTests(_TmpRTL):
         r = run_tool(self.rtl, write_csv(self.rtl))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(original, self.snapshot())
+
+
+class CommentedConnectionTests(_ConnListBase):
+    """A `.port(...)` inside a comment is not a connection: the tool neither
+    counts nor rewrites it, and a `)` inside a comment doesn't end one."""
 
     def test_commented_out_connection_mid_list(self):
         self._check("// .sink_in (old)", ".clk (clk)")
@@ -1085,6 +1094,32 @@ class CommentedConnectionTests(_TmpRTL):
     def test_paren_in_comment_inside_connection(self):
         self._check(".sink_in (real_sig  // see f(x)", "),", ".clk (clk)",
                     rewire=True)
+
+
+class NestedParenTests(_ConnListBase):
+    """A rewired connection keeps its whole expression, nested parentheses
+    included, so the cleanup restores it exactly."""
+
+    def test_nested_expression(self):
+        self._check(".sink_in (real_sig & (real_sig | 8'h0f)),", ".clk (clk)",
+                    rewire=True)
+
+    def test_function_call(self):
+        self._check(".sink_in ($unsigned(real_sig)),", ".clk (clk)", rewire=True)
+
+    def test_doubly_nested(self):
+        self._check(".sink_in ((real_sig)),", ".clk (clk)", rewire=True)
+
+    def test_nested_expression_with_comment(self):
+        self._check(".sink_in ((real_sig)  // keep (x)", "),", ".clk (clk)",
+                    rewire=True)
+
+    def test_nested_parens_in_another_connection(self):    # guard
+        self._check(".clk ((clk))")
+
+    def test_block_comment_rewire_refused(self):           # guard
+        self._design(".sink_in (real_sig /* ) */ ),", ".clk (clk)", rewire=True)
+        self.assertRejected(write_csv(self.rtl, self.ROW), "WRITE-BACK ERROR")
 
 
 class PromptTests(_TmpRTL):
