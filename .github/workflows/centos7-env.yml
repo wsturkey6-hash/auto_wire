@@ -27,27 +27,46 @@ jobs:
             python=3.11 pyslang=11.0 openpyxl pytest
           micromamba list -p "$PWD/env"
 
-      - name: Pack
+      - name: Slim and pack
         shell: bash -el {0}
         run: |
-          conda-pack -p "$PWD/env" -o autowire-env-centos7.tar.gz
-          ls -lh autowire-env-centos7.tar.gz
+          # Not needed at run time; *.exe are Windows launchers that mail
+          # filters reject.
+          cd env
+          find . -name '*.exe' -delete
+          find . -name '*.a' -delete
+          find . -name '__pycache__' -type d -prune -exec rm -rf {} +
+          rm -rf include share/man share/doc share/info lib/tcl8* lib/tk8* \
+                 lib/libtk* lib/libtcl* lib/python3.11/idlelib \
+                 lib/python3.11/tkinter lib/python3.11/turtledemo \
+                 lib/python3.11/ensurepip
+          cd ..
+          conda-pack -p "$PWD/env" --ignore-missing-files -o autowire-env-centos7.tar
+          xz -9 -T0 autowire-env-centos7.tar
+          mkdir parts
+          split -b 17M -d autowire-env-centos7.tar.xz parts/autowire-env.part
+          (cd parts && sha256sum autowire-env.part* > SHA256SUMS.txt \
+            && sha256sum ../autowire-env-centos7.tar.xz | sed 's# \.\./# #' >> SHA256SUMS.txt)
+          ls -lh autowire-env-centos7.tar.xz parts
 
       - name: Test in CentOS 7
         run: |
           docker run --rm -v "$PWD:/w" -e PYTHONIOENCODING=utf-8 centos:7 bash -ec '
             ldd --version | head -1
+            cd /tmp
+            cat /w/parts/autowire-env.part* > autowire-env-centos7.tar.xz
+            grep tar.xz /w/parts/SHA256SUMS.txt | sha256sum -c -
             mkdir /opt/env
-            tar -xzf /w/autowire-env-centos7.tar.gz -C /opt/env
+            tar -xJf autowire-env-centos7.tar.xz -C /opt/env
             /opt/env/bin/python /opt/env/bin/conda-unpack
+            /opt/env/bin/python -m compileall -q /opt/env/lib/python3.11 > /dev/null || true
             /opt/env/bin/python -c "import ssl, pyslang, openpyxl; print(ssl.OPENSSL_VERSION, pyslang.__version__, openpyxl.__version__)"
             cp -r /w/autowire_v3.py /w/tests /w/test_rtl /w/*.csv /tmp/
-            cd /tmp
             /opt/env/bin/python -m unittest discover -s tests
           '
 
       - uses: actions/upload-artifact@v4
         with:
           name: autowire-env-centos7
-          path: autowire-env-centos7.tar.gz
+          path: parts/
           compression-level: 0
