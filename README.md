@@ -39,6 +39,24 @@ python autowire_v3.py -d ./rtl -T TOP -c conn.csv --dry-run   # preview only
 python autowire_v3.py -d ./rtl -T TOP --tree                  # print hierarchy
 ```
 
+### Optional LLM review
+`--llm-review` asks an OpenAI-compatible chat API (e.g. a local gpt-oss or
+Qwen served by vLLM or Ollama) to flag connections that look like design
+mistakes — a clock wired to data, an active-low reset to an active-high one,
+tx to tx, a comment that doesn't match the signals. The findings are advisory:
+they are printed before the write-back prompt and logged under `[LLM REVIEW]`
+in the warning log, and they never change or block the write-back. If the API
+can't be reached or its reply can't be parsed, the run continues without it.
+```
+export AUTOWIRE_LLM_URL=http://llm-host:8000/v1
+export AUTOWIRE_LLM_MODEL=gpt-oss-120b
+export AUTOWIRE_LLM_API_KEY=...        # read only from the environment
+python autowire_v3.py -d ./rtl -T TOP -c conn.csv --llm-review
+```
+`--llm-url` / `--llm-model` override the environment variables. Only each
+connection's module and signal names, directions, widths, wire name, and CSV
+comment are sent — no RTL source.
+
 ## Connection CSV format
 Comment lines start with `#`; blank lines are ignored. The file may be UTF-8
 (with or without a BOM, e.g. Excel's "CSV UTF-8") or in the system encoding.

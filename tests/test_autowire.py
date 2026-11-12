@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import glob
+import json
 import shutil
 import subprocess
 import tempfile
@@ -79,9 +80,11 @@ def write_fixture_nonansi(d: Path):
     """), newline="\n")
 
 
-def run_tool(rtldir, csvpath, top="top", extra=(), answer="y\n", cwd=None):
+def run_tool(rtldir, csvpath, top="top", extra=(), answer="y\n", cwd=None,
+             env_extra=None):
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    env.update(env_extra or {})
     # Keep the warning log next to the fixture instead of the caller's cwd.
     return subprocess.run(
         [sys.executable, AUTOWIRE, "-d", str(rtldir), "-T", top,
@@ -786,6 +789,25 @@ class DestinationTests(_TmpRTL):
         self.assertRejected(write_csv(self.rtl, "w_q,8,top/u_mid/u_leaf.q,top.other,x"),
                             "input")
 
+    def test_dst_typo_warns_with_similar_port(self):
+        write_files(self.rtl, {"leaf.v": """\
+            module leaf (input clk, input [7:0] data_i);
+            endmodule
+        """, "mid.v": MID_LEAF, "top.v": self.TOP})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_d,8,top.data_in,top/u_mid/u_leaf.data_in,x"),
+                     answer="n\n")
+        out = r.stdout + r.stderr
+        self.assertIn('dst port "data_in"', out)
+        self.assertIn("similar port: data_i", out)
+
+    def test_new_dst_without_similar_port_is_note(self):
+        write_files(self.rtl, {"leaf.v": LEAF_Q, "mid.v": MID_LEAF, "top.v": self.TOP})
+        r = run_tool(self.rtl, write_csv(self.rtl, "w_d,8,top.data_in,top/u_mid/u_leaf.sink_in,x"),
+                     answer="n\n")
+        out = r.stdout + r.stderr
+        self.assertIn('NOTE row 2: dst port "sink_in"', out)
+        self.assertNotIn("similar port", out)
+
     def test_dst_internal_signal_rejected(self):
         write_files(self.rtl, {"leaf.v": """\
             module leaf (input clk);
@@ -1442,6 +1464,164 @@ class SampleTests(_TmpRTL):
         r = run_tool(self.rtl, csv, top="i2c_master_top")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(first, self.snapshot())
+
+
+# ── optional LLM review ──────────────────────────────────────────────────────
+class LlmParseTests(unittest.TestCase):
+    def test_keeps_valid_findings_only(self):
+        reply = ('Here you go:\n```json\n['
+                 '{"row": 2, "severity": "HIGH", "reason": "clock to data"},'
+                 '{"row": "3", "severity": "low", "reason": "odd name"},'
+                 '{"row": 9, "severity": "high", "reason": "unknown row"},'
+                 '{"row": 2, "severity": "fatal", "reason": "bad severity"},'
+                 '{"row": 3, "severity": "low", "reason": "  "},'
+                 '{"row": true, "severity": "low", "reason": "bool row"},'
+                 '"not an object"]\n```')
+        self.assertEqual(aw._llm_parse(reply, {2, 3}), [
+            {"row": 2, "severity": "high", "reason": "clock to data"},
+            {"row": 3, "severity": "low", "reason": "odd name"}])
+
+    def test_reply_without_array_is_an_error(self):
+        with self.assertRaises(ValueError):
+            aw._llm_parse("Everything looks fine.", {2})
+
+
+class _FakeLLM:
+    """An OpenAI-compatible /chat/completions endpoint on localhost."""
+    def __init__(self, content):
+        import http.server, threading
+        fake = self
+        self.requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                fake.requests.append((self.path, dict(self.headers), json.loads(body)))
+                data = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}/v1"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class LlmReviewTests(_TmpRTL):
+    KEY = "sk-test-not-a-real-key"
+
+    def setUp(self):
+        super().setUp()
+        write_fixture(self.rtl)
+        self.csv = write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,route down")
+        self.log = self.rtl / "autowire_warn.log"
+
+    def run_llm(self, url, *extra):
+        return run_tool(self.rtl, self.csv,
+                        extra=("--llm-review", "--llm-url", url, "--llm-model", "m1", *extra),
+                        env_extra={"AUTOWIRE_LLM_API_KEY": self.KEY})
+
+    def test_findings_reported_and_logged(self):
+        llm = _FakeLLM('[{"row": 2, "severity": "medium", "reason": "data into a sink"}]')
+        try:
+            r = self.run_llm(llm.url)
+        finally:
+            llm.close()
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("[medium] row 2 w_data: data into a sink", out)
+        log = self.log.read_text(encoding="utf-8")
+        self.assertIn("[LLM REVIEW]", log)
+        self.assertIn("data into a sink", log)
+        self.assertIn("sink_in", read_all(self.rtl)["leaf.v"])     # still written
+        path, headers, body = llm.requests[0]
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual(headers.get("Authorization"), f"Bearer {self.KEY}")
+        self.assertEqual(body["model"], "m1")
+        rows = json.loads(body["messages"][1]["content"])
+        self.assertEqual(rows[0]["src"]["signal"], "data_in")
+        self.assertEqual(rows[0]["dst"]["direction"], "new port")
+        self.assertNotIn(self.KEY, out + log)
+
+    def test_unreachable_llm_does_not_stop_the_run(self):
+        llm = _FakeLLM("[]")
+        url = llm.url
+        llm.close()                                   # nothing listens there now
+        r = self.run_llm(url)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("LLM review incomplete", out)
+        self.assertIn("sink_in", read_all(self.rtl)["leaf.v"])
+
+    def test_key_never_printed_on_bad_key(self):
+        llm = _FakeLLM("[]")
+        try:
+            for key in (self.KEY + "\n", "sk-in\nside"):
+                r = run_tool(self.rtl, self.csv,
+                             extra=("--llm-review", "--llm-url", llm.url, "--llm-model", "m1"),
+                             env_extra={"AUTOWIRE_LLM_API_KEY": key})
+                out = r.stdout + r.stderr + self.log.read_text(encoding="utf-8")
+                self.assertEqual(r.returncode, 0, out)
+                self.assertNotIn("sk-", out)
+        finally:
+            llm.close()
+
+    def test_non_text_reply_does_not_stop_the_run(self):
+        for content in (123, {"a": 1}, [{"row": 2}]):
+            llm = _FakeLLM(content)
+            try:
+                r = self.run_llm(llm.url)
+            finally:
+                llm.close()
+            out = r.stdout + r.stderr
+            self.assertEqual(r.returncode, 0, out)
+            self.assertIn("LLM review incomplete", out)
+
+    def test_hostile_replies_do_not_stop_the_run(self):
+        cases = {
+            "deep": ("[" * 100000 + "]" * 100000, "LLM review incomplete"),
+            "surrogate": ('[{"row": 2, "severity": "low", "reason": "bad \\ud800 x"}]',
+                          "[low] row 2"),
+            "echo": (f'[{{"row": 2, "severity": "low", "reason": "key {self.KEY}"}}]',
+                     "key ***"),
+        }
+        for name, (content, needle) in cases.items():
+            llm = _FakeLLM(content)
+            try:
+                r = self.run_llm(llm.url)
+            finally:
+                llm.close()
+            out = r.stdout + r.stderr
+            self.assertEqual(r.returncode, 0, f"{name}: {out[-2000:]}")
+            log = self.log.read_text(encoding="utf-8")
+            self.assertIn(needle, out + log, name)
+            self.assertNotIn(self.KEY, out + log, name)
+
+    def test_no_flag_no_request(self):
+        llm = _FakeLLM("[]")
+        try:
+            r = run_tool(self.rtl, self.csv,
+                         env_extra={"AUTOWIRE_LLM_URL": llm.url, "AUTOWIRE_LLM_MODEL": "m1"})
+        finally:
+            llm.close()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(llm.requests, [])
+        self.assertNotIn("LLM REVIEW", r.stdout)
+
+    def test_flag_without_url_is_an_error(self):
+        r = run_tool(self.rtl, self.csv, extra=("--llm-review",),
+                     env_extra={"AUTOWIRE_LLM_URL": "", "AUTOWIRE_LLM_MODEL": ""})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--llm-url", r.stderr)
 
 
 # ── optional external-linter cross-check ─────────────────────────────────────

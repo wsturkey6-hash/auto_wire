@@ -35,12 +35,12 @@ autowire_v3.py  ─  SoC Integration Auto-Wiring Tool  v3.0
   python3 autowire_v3.py --rtl-dir ./rtl --top TOP --csv conn.csv --no-color
 """
 
-import re, os, sys, csv, argparse, getpass, locale
+import re, os, sys, csv, json, argparse, getpass, locale, http.client, urllib.request
 from datetime import date as dt_date
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, get_close_matches
 
 try:
     import openpyxl
@@ -1474,7 +1474,7 @@ def print_plan_summary(conns: List[ConnSpec], cs: ChangeSet,
             print(f'      -> {col(f"assign {ms.assign_lhs} = {ms.assign_rhs};", C.DIM)}')
 
 def generate_warn_log(conns: List[ConnSpec], mismatches: List[MismatchInfo],
-                      user: str) -> str:
+                      user: str, llm_lines: Optional[List[str]] = None) -> str:
     lines = [
         f'AutoWire v3  Warning Log',
         f'{_stamp(user)}',
@@ -1498,6 +1498,11 @@ def generate_warn_log(conns: List[ConnSpec], mismatches: List[MismatchInfo],
                 ''
             ]
 
+    if llm_lines is not None:
+        lines += ['[LLM REVIEW]',
+                  'Advisory findings from the LLM; they did not change the write-back.',
+                  ''] + llm_lines + ['']
+
     lines += [
         '[CONNECTIONS PROCESSED]',
         ''
@@ -1516,6 +1521,120 @@ def generate_warn_log(conns: List[ConnSpec], mismatches: List[MismatchInfo],
         lines += ['No width warnings.', '']
 
     return '\n'.join(lines)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM REVIEW  (optional, advisory only — never changes the plan or the write-back)
+# ──────────────────────────────────────────────────────────────────────────────
+LLM_BATCH      = 50     # connections per request
+LLM_TIMEOUT    = 120    # seconds per request
+LLM_SEVERITIES = ('high', 'medium', 'low')
+LLM_SYSTEM_PROMPT = """\
+You review point-to-point connections planned for a Verilog/SystemVerilog SoC.
+Each connection drives the dst signal from the src signal. Ports, directions,
+and bit widths come from a real parser and are correct; the tool already
+checks existence, direction, multiple drivers, and width mismatches. Look only
+for connections that are probably a design mistake, for example: a clock or
+reset wired to a data signal, an active-low reset (_n, _b) wired to an
+active-high one or the reverse, tx wired to tx or rx to rx, a valid wired to a
+ready, a "new port" whose name looks like a typo of a related signal, or a
+comment that does not match the signals. Do not report connections that look
+fine.
+Reply with only a JSON array, no other text:
+[{"row": <row number>, "severity": "high" | "medium" | "low", "reason": "<one short sentence>"}]
+Reply [] if nothing looks wrong."""
+
+
+def _llm_rows(db: RTLDatabase, conns: List[ConnSpec]) -> List[dict]:
+    """What the model sees: names, directions, widths, and the CSV comment."""
+    def end(path, port, width):
+        n, si = db.node(path), db.sig_info(path, port)
+        return {'module': n.module_name if n else '?', 'signal': port,
+                'direction': si.direction if si else 'new port',
+                'width': si.width if si else width}
+    return [{'row': s.row_num, 'wire': s.wire_name,
+             'src': end(s.src_path, s.src_port, None),
+             'dst': end(s.dst_path, s.dst_port, s.bit_width),
+             'comment': s.comment} for s in conns]
+
+
+def _llm_chat(url: str, model: str, key: str, rows: List[dict]) -> str:
+    body = json.dumps({
+        'model': model, 'temperature': 0,
+        'messages': [{'role': 'system', 'content': LLM_SYSTEM_PROMPT},
+                     {'role': 'user', 'content': json.dumps(rows, ensure_ascii=False)}],
+    }).encode('utf-8')
+    headers = {'Content-Type': 'application/json'}
+    if key:
+        headers['Authorization'] = f'Bearer {key}'
+    req = urllib.request.Request(url.rstrip('/') + '/chat/completions',
+                                 data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+        reply = json.loads(resp.read().decode('utf-8'))
+    content = reply['choices'][0]['message']['content'] or ''
+    if not isinstance(content, str):
+        raise ValueError('the reply content is not text')
+    return content
+
+
+def _llm_parse(content: str, valid_rows: set) -> List[dict]:
+    """Findings from the reply; anything malformed or naming an unknown row is dropped."""
+    start, end = content.find('['), content.rfind(']')
+    if start < 0 or end < start:
+        raise ValueError('the reply has no JSON array')
+    items = json.loads(content[start:end + 1])
+    if not isinstance(items, list):
+        raise ValueError('the reply is not a JSON array')
+    found = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        row, sev, reason = it.get('row'), it.get('severity'), it.get('reason')
+        if isinstance(row, str) and row.strip().isdigit():
+            row = int(row)
+        sev = sev.lower() if isinstance(sev, str) else ''
+        if (isinstance(row, int) and not isinstance(row, bool) and row in valid_rows
+                and sev in LLM_SEVERITIES
+                and isinstance(reason, str) and reason.strip()):
+            found.append({'row': row, 'severity': sev, 'reason': reason.strip()})
+    return found
+
+
+def llm_review(db: RTLDatabase, conns: List[ConnSpec], url: str, model: str,
+               key: str) -> Tuple[List[dict], Optional[str]]:
+    """(findings, error). On error the findings of the batches before it are kept."""
+    if not key.isprintable():
+        return [], 'AUTOWIRE_LLM_API_KEY contains control characters'
+    def clean(text):
+        # Lone surrogates can't be written to the UTF-8 log; never echo the key.
+        text = text.encode('utf-8', 'replace').decode('utf-8')
+        return text.replace(key, '***') if key else text
+
+    rows, found, err = _llm_rows(db, conns), [], None
+    valid = {r['row'] for r in rows}
+    for i in range(0, len(rows), LLM_BATCH):
+        try:
+            found += _llm_parse(_llm_chat(url, model, key, rows[i:i + LLM_BATCH]), valid)
+        except (OSError, http.client.HTTPException, ValueError, KeyError,
+                IndexError, TypeError, RecursionError) as e:
+            err = clean(f'{type(e).__name__}: {e}')
+            break
+    for f in found:
+        f['reason'] = clean(f['reason'])
+    order = {s: n for n, s in enumerate(LLM_SEVERITIES)}
+    found.sort(key=lambda f: (order[f['severity']], f['row']))
+    return found, err
+
+
+def llm_review_lines(conns: List[ConnSpec], found: List[dict],
+                     error: Optional[str]) -> List[str]:
+    wire = {s.row_num: s.wire_name for s in conns}
+    lines = [f'  [{f["severity"]}] row {f["row"]} {wire[f["row"]]}: {f["reason"]}'
+             for f in found]
+    if error:
+        lines.append(f'  LLM review incomplete ({error}); the run continues without it.')
+    elif not found:
+        lines.append('  No issues reported.')
+    return lines
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BANNER
@@ -1581,10 +1700,22 @@ ENDPOINT FORMAT
                     help='Print the parsed hierarchy tree and exit')
     ap.add_argument('--no-color',      action='store_true',
                     help='Disable ANSI color output')
+    ap.add_argument('--llm-review',    action='store_true',
+                    help='Ask an OpenAI-compatible LLM to flag connections that '
+                         'look like mistakes (advisory only). The API key is read '
+                         'from AUTOWIRE_LLM_API_KEY')
+    ap.add_argument('--llm-url',   default=os.environ.get('AUTOWIRE_LLM_URL'),
+                    help='LLM API base URL, e.g. http://host:8000/v1 '
+                         '(default: $AUTOWIRE_LLM_URL)')
+    ap.add_argument('--llm-model', default=os.environ.get('AUTOWIRE_LLM_MODEL'),
+                    help='LLM model name (default: $AUTOWIRE_LLM_MODEL)')
 
     args = ap.parse_args()
     if not args.csv and not args.tree:
         ap.error('the following arguments are required: --csv/-c')
+    if args.llm_review and not (args.llm_url and args.llm_model):
+        ap.error('--llm-review needs --llm-url and --llm-model '
+                 '(or AUTOWIRE_LLM_URL and AUTOWIRE_LLM_MODEL)')
 
     global USE_COLOR
     if args.no_color or not sys.stdout.isatty():
@@ -1673,9 +1804,17 @@ ENDPOINT FORMAT
                         f'module "{n.module_name}". A source signal must already '
                         f'exist (add it to the RTL first).')
                 else:
-                    # Not a problem: the tool creates missing dst ports.
-                    print(col(f'  NOTE row {spec.row_num}: dst port "{port}" will be '
-                              f'added to module "{n.module_name}"', C.DIM))
+                    # Not a problem: the tool creates missing dst ports. But a
+                    # name close to an existing port is more likely a typo.
+                    similar = get_close_matches(port, list(mod.ports), n=3)
+                    if similar:
+                        print(col(f'  WARN row {spec.row_num}: dst port "{port}" '
+                                  f'will be added to module "{n.module_name}", '
+                                  f'which already has a similar port: '
+                                  f'{", ".join(similar)}. Typo?', C.YELLOW))
+                    else:
+                        print(col(f'  NOTE row {spec.row_num}: dst port "{port}" will be '
+                                  f'added to module "{n.module_name}"', C.DIM))
 
     # ── Validate destinations ─────────────────────────────────────────────────
     seen_dst: Dict[Tuple[str, str], int] = {}
@@ -1792,6 +1931,18 @@ ENDPOINT FORMAT
                   f'file(s):', C.BOLD))
         for fp in cleanup: print(f'    {col(fp, C.DIM)}')
 
+    # ── Optional LLM review (advisory; never blocks the write-back) ───────────
+    llm_lines: Optional[List[str]] = None
+    if args.llm_review and conns:
+        print(col(f'\n  Asking {args.llm_model} to review {len(conns)} '
+                  f'connection(s)...', C.DIM))
+        found, err = llm_review(db, conns, args.llm_url, args.llm_model,
+                                os.environ.get('AUTOWIRE_LLM_API_KEY', '').strip())
+        llm_lines = llm_review_lines(conns, found, err)
+        print(col(f'\n  LLM REVIEW (advisory, {args.llm_model}):', C.YELLOW, C.BOLD))
+        for line in llm_lines:
+            print(col(line, C.YELLOW if found or err else C.DIM))
+
     # ── Confirm before writing ────────────────────────────────────────────────
     if not args.dry_run:
         print(f'\n  {hr()}')
@@ -1829,8 +1980,8 @@ ENDPOINT FORMAT
         return
 
     # ── Write warning log ─────────────────────────────────────────────────────
-    warn_content = generate_warn_log(conns, mismatches, user)
-    with open(warn_log, 'w') as f: f.write(warn_content)
+    warn_content = generate_warn_log(conns, mismatches, user, llm_lines)
+    with open(warn_log, 'w', encoding='utf-8') as f: f.write(warn_content)
     if mismatches:
         print(col(f'  ⚠  {warn_log}  (width mismatches — please review)', C.YELLOW))
     else:
