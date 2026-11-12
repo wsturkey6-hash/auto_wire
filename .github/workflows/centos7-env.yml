@@ -1,0 +1,53 @@
+# Builds a self-contained Python environment (Python 3.11 + pyslang + openpyxl)
+# that runs on CentOS 7 (glibc 2.17), tests it in a CentOS 7 container, and
+# uploads it as a tarball to copy onto an offline workstation.
+name: centos7-env
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: packer
+          create-args: conda-pack
+          init-shell: bash
+
+      - name: Create the environment for glibc 2.17
+        shell: bash -el {0}
+        env:
+          CONDA_OVERRIDE_GLIBC: "2.17"
+        run: |
+          micromamba create -y -p "$PWD/env" -c conda-forge \
+            python=3.11 pyslang=11.0 openpyxl pytest
+          micromamba list -p "$PWD/env"
+
+      - name: Pack
+        shell: bash -el {0}
+        run: |
+          conda-pack -p "$PWD/env" -o autowire-env-centos7.tar.gz
+          ls -lh autowire-env-centos7.tar.gz
+
+      - name: Test in CentOS 7
+        run: |
+          docker run --rm -v "$PWD:/w" -e PYTHONIOENCODING=utf-8 centos:7 bash -ec '
+            ldd --version | head -1
+            mkdir /opt/env
+            tar -xzf /w/autowire-env-centos7.tar.gz -C /opt/env
+            /opt/env/bin/python /opt/env/bin/conda-unpack
+            /opt/env/bin/python -c "import ssl, pyslang, openpyxl; print(ssl.OPENSSL_VERSION, pyslang.__version__, openpyxl.__version__)"
+            cp -r /w/autowire_v3.py /w/tests /w/test_rtl /w/*.csv /tmp/
+            cd /tmp
+            /opt/env/bin/python -m unittest discover -s tests
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autowire-env-centos7
+          path: autowire-env-centos7.tar.gz
+          compression-level: 0
