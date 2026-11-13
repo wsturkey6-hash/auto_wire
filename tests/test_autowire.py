@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import glob
+import io
 import json
 import shutil
 import subprocess
@@ -1464,6 +1465,155 @@ class SampleTests(_TmpRTL):
         r = run_tool(self.rtl, csv, top="i2c_master_top")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(first, self.snapshot())
+
+
+# ── machine interface: --yes, --json, --expect-plan ──────────────────────────
+class MachineInterfaceTests(_TmpRTL):
+    ROW = "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,route down"
+
+    def setUp(self):
+        super().setUp()
+        write_fixture(self.rtl)
+        self.csv = write_csv(self.rtl, self.ROW)
+        self.json = self.rtl / "out.json"
+
+    def run_json(self, *extra, answer=""):
+        r = run_tool(self.rtl, self.csv, extra=("--json", str(self.json), *extra),
+                     answer=answer)
+        rep = json.loads(self.json.read_text(encoding="utf-8")) if self.json.exists() else None
+        return r, rep
+
+    def test_yes_writes_without_input_same_as_answering_y(self):
+        r = run_tool(self.rtl, self.csv, extra=("--yes",), answer="")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Proceed with write-back", r.stdout)
+        with_yes = self.snapshot()
+        other = Path(tempfile.mkdtemp())
+        try:
+            write_fixture(other)
+            run_tool(other, write_csv(other, self.ROW), answer="y\n")
+            self.assertEqual(with_yes, {p.name: p.read_bytes()
+                                        for p in sorted(other.glob("*.v"))})
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_no_input_without_yes_writes_nothing(self):
+        before = self.snapshot()
+        r = run_tool(self.rtl, self.csv, answer="")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(before, self.snapshot())
+
+    def test_preview_json_matches_what_is_written(self):
+        before = self.snapshot()
+        r, rep = self.run_json("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(before, self.snapshot(), "dry run modified files")
+        self.assertEqual(rep["status"], "preview")
+        self.assertEqual(rep["written"], [])
+        self.assertEqual(rep["connections"][0]["wire_name"], "w_data")
+        self.assertEqual(rep["connections"][0]["dst"], "top/u_mid/u_leaf.sink_in")
+        self.assertTrue(any("sink_in" in w for w in rep["warnings"]))
+        self.assertEqual(sorted(Path(f["path"]).name for f in rep["files"]),
+                         ["leaf.v", "mid.v", "top.v"])
+
+        r2, rep2 = self.run_json("--yes", "--expect-plan", rep["plan_id"])
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        self.assertEqual(rep2["status"], "written")
+        self.assertEqual(rep2["plan_id"], rep["plan_id"])
+        self.assertEqual(sorted(rep2["written"]), sorted(f["path"] for f in rep["files"]))
+        after = self.snapshot()
+        for f in rep["files"]:
+            name = Path(f["path"]).name
+            added = [l[1:] for l in f["diff"].splitlines()
+                     if l.startswith("+") and not l.startswith("+++")]
+            removed = [l[1:] for l in f["diff"].splitlines()
+                       if l.startswith("-") and not l.startswith("---")]
+            old, new = before[name].decode().splitlines(), after[name].decode().splitlines()
+            for line in added:
+                self.assertIn(line, new, name)
+            for line in removed:
+                self.assertIn(line, old, name)
+            self.assertEqual(len(new) - len(old), len(added) - len(removed), name)
+
+    def test_rtl_edit_after_preview_refuses_write(self):
+        _, rep = self.run_json("--dry-run")
+        top = self.rtl / "top.v"
+        top.write_text(top.read_text().replace("input        clk,", "input        clk,  // edited"),
+                       newline="\n")
+        before = self.snapshot()
+        r, rep2 = self.run_json("--yes", "--expect-plan", rep["plan_id"])
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("PLAN CHANGED", r.stdout)
+        self.assertEqual(rep2["status"], "stale")
+        self.assertEqual(before, self.snapshot(), "files were modified")
+
+    def test_csv_edit_after_preview_refuses_write(self):
+        _, rep = self.run_json("--dry-run")
+        write_csv(self.rtl, self.ROW.replace("w_data", "w_other"))
+        before = self.snapshot()
+        r, _ = self.run_json("--yes", "--expect-plan", rep["plan_id"])
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(before, self.snapshot(), "files were modified")
+
+    def test_unrelated_comment_edit_keeps_plan(self):
+        write_files(self.rtl, {"spare.v": "module spare (input a);\nendmodule\n"})
+        _, rep = self.run_json("--dry-run")
+        (self.rtl / "spare.v").write_text("module spare (input a); // note\nendmodule\n",
+                                          newline="\n")
+        r, rep2 = self.run_json("--yes", "--expect-plan", rep["plan_id"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(rep2["status"], "written")
+
+    def test_rerun_after_write_reports_no_file_changes(self):
+        self.run_json("--yes")
+        before = self.snapshot()
+        r, rep = self.run_json("--dry-run")
+        self.assertEqual(rep["files"], [])
+        self.assertEqual(before, self.snapshot())
+
+    def test_edit_during_run_refuses_write(self):
+        """A file changed between the scan and the write is never overwritten."""
+        top = self.rtl / "top.v"
+
+        def edit_then_yes(prompt=""):
+            top.write_text(top.read_text() + "// edited meanwhile\n", newline="\n")
+            return "y"
+
+        argv = ["autowire_v3.py", "-d", str(self.rtl), "-T", "top", "-c", str(self.csv),
+                "--no-color", "--out-log", str(self.rtl / "w.log")]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch("builtins.input", edit_then_yes), \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                aw.main()
+        self.assertEqual(cm.exception.code, 3)
+        self.assertIn("// edited meanwhile", top.read_text())
+        self.assertNotIn("AUTO_WIRE", "".join(read_all(self.rtl).values()))
+
+    def test_tree_json(self):
+        r = run_tool(self.rtl, self.csv, extra=("--tree", "--json", str(self.json)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rep = json.loads(self.json.read_text(encoding="utf-8"))
+        self.assertEqual(rep["status"], "tree")
+        t = rep["tree"]
+        self.assertEqual((t["module"], t["path"]), ("top", "top"))
+        self.assertEqual(t["children"][0]["path"], "top/u_mid")
+        self.assertEqual(t["children"][0]["children"][0]["path"], "top/u_mid/u_leaf")
+        self.assertIn({"name": "data_in", "direction": "input", "width": 8},
+                      rep["modules"]["top"]["ports"])
+
+    def test_error_run_removes_earlier_json(self):
+        self.run_json("--dry-run")
+        self.assertTrue(self.json.exists())
+        write_csv(self.rtl, "w_z,1,top.does_not_exist,top/u_mid/u_leaf.sink_in,bad")
+        r, rep = self.run_json("--yes")
+        self.assertEqual(r.returncode, 1)
+        self.assertIsNone(rep)
+
+    def test_no_json_flag_writes_no_json(self):
+        r = run_tool(self.rtl, self.csv)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.json.exists())
 
 
 # ── optional LLM review ──────────────────────────────────────────────────────

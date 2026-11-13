@@ -35,12 +35,12 @@ autowire_v3.py  ─  SoC Integration Auto-Wiring Tool  v3.0
   python3 autowire_v3.py --rtl-dir ./rtl --top TOP --csv conn.csv --no-color
 """
 
-import re, os, sys, csv, json, argparse, getpass, locale, http.client, urllib.request
+import re, os, sys, csv, json, hashlib, argparse, getpass, locale, http.client, urllib.request
 from datetime import date as dt_date
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from difflib import SequenceMatcher, get_close_matches
+from difflib import SequenceMatcher, get_close_matches, unified_diff
 
 try:
     import openpyxl
@@ -314,6 +314,24 @@ class RTLDatabase:
             return _blank_stamps(disk.decode(enc)) == _blank_stamps(data.decode(enc))
         except UnicodeDecodeError:
             return False
+
+    def scanned_text(self, filepath: str) -> str:
+        """The file's text exactly as it was read when scanned."""
+        return self._encodings[filepath][1]
+
+    def changed_since_scan(self, filepath: str) -> bool:
+        enc, orig = self._encodings[filepath]
+        try:
+            return Path(filepath).read_bytes() != orig.encode(enc)
+        except OSError:
+            return True
+
+    def tree_dict(self, node: HierNode = None) -> Optional[dict]:
+        node = node or self.root
+        if not node: return None
+        return {'module': node.module_name, 'inst': node.inst_name,
+                'path': node.path,
+                'children': [self.tree_dict(ch) for ch in node.children]}
 
     def stale_sources(self) -> Dict[str, str]:
         """Pristine text of each scanned file that still holds tool output."""
@@ -1432,6 +1450,22 @@ def render_outputs(db: RTLDatabase, cs: ChangeSet, user: str) -> Dict[str, bytes
             outputs[fp] = db.encode_source(fp, text)
     return outputs
 
+def plan_report(db: RTLDatabase, outputs: Dict[str, bytes]) -> Tuple[str, List[dict]]:
+    """(plan id, files that will change with their unified diff). The plan id
+    is a fingerprint of every file as scanned and as it will be written, with
+    the user/date stamps left out; two runs with the same id write the same
+    content."""
+    h, files = hashlib.sha256(), []
+    for fp in sorted(outputs):
+        old = db.scanned_text(fp)
+        new = outputs[fp].decode(db._encodings[fp][0])
+        for part in (fp, old, _blank_stamps(new)):
+            h.update(part.encode('utf-8', 'surrogateescape') + b'\0')
+        if not db.same_but_stamps(fp, outputs[fp]):
+            diff = unified_diff(old.splitlines(), new.splitlines(), fp, fp, lineterm='')
+            files.append({'path': fp, 'diff': '\n'.join(diff)})
+    return h.hexdigest(), files
+
 # ──────────────────────────────────────────────────────────────────────────────
 # REPORTING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1650,6 +1684,9 @@ def print_banner():
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
+EXIT_STALE = 3      # the RTL or the plan changed since it was previewed/scanned
+_ANSI_RE   = re.compile(r'\x1b\[[0-9;]*m')
+
 def main():
     # The banner and status glyphs (✓ ⚠ box-drawing) are non-ASCII. On a
     # console whose codec can't encode them (e.g. Windows cp950) printing them
@@ -1700,6 +1737,16 @@ ENDPOINT FORMAT
                     help='Print the parsed hierarchy tree and exit')
     ap.add_argument('--no-color',      action='store_true',
                     help='Disable ANSI color output')
+    ap.add_argument('--yes', '-y',     action='store_true',
+                    help='Write the files without asking for confirmation')
+    ap.add_argument('--json',          default=None, metavar='FILE',
+                    help='Also write the result (connections, warnings, file '
+                         'diffs, plan id; with --tree, the hierarchy and module '
+                         'ports) to FILE as JSON')
+    ap.add_argument('--expect-plan',   default=None, metavar='ID',
+                    help=f'Write only if the plan id still equals ID (from an '
+                         f'earlier --dry-run --json); otherwise write nothing '
+                         f'and exit with status {EXIT_STALE}')
     ap.add_argument('--llm-review',    action='store_true',
                     help='Ask an OpenAI-compatible LLM to flag connections that '
                          'look like mistakes (advisory only). The API key is read '
@@ -1717,12 +1764,32 @@ ENDPOINT FORMAT
         ap.error('--llm-review needs --llm-url and --llm-model '
                  '(or AUTOWIRE_LLM_URL and AUTOWIRE_LLM_MODEL)')
 
+    if args.json:
+        # A run that stops on an error writes no JSON; don't leave an earlier
+        # run's result there to be read as this one's.
+        try:
+            os.remove(args.json)
+        except FileNotFoundError:
+            pass
+
     global USE_COLOR
     if args.no_color or not sys.stdout.isatty():
         USE_COLOR = False
 
     user     = getpass.getuser()
     warn_log = args.out_log or 'autowire_warn.log'
+
+    report: dict = {'tool': 'autowire_v3', 'top': args.top, 'warnings': []}
+
+    def note(msg: str, *codes):
+        print(col(msg, *codes))
+        report['warnings'].append(_ANSI_RE.sub('', msg).strip())
+
+    def write_json(status: str):
+        if args.json:
+            report['status'] = status
+            with open(args.json, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=1)
 
     print_banner()
     print(f'\n  User      : {col(user,    C.WHITE, C.BOLD)}')
@@ -1752,10 +1819,22 @@ ENDPOINT FORMAT
                   C.YELLOW, C.BOLD))
         for line in db.elab_error_text.splitlines()[:10]:
             print(col(f'    {line}', C.DIM))
+        report['warnings'].append(
+            f'{db.elab_error_count} elaboration error(s) reported by pyslang; '
+            f'the hierarchy may be incomplete: ' + db.elab_error_text.strip())
 
     if args.tree:
         print(col('\n  Hierarchy tree:', C.BOLD))
         db.print_tree()
+        report['tree'] = db.tree_dict()
+        report['modules'] = {
+            m.name: {'file': m.filepath,
+                     'ports':   [{'name': s.name, 'direction': s.direction, 'width': s.width}
+                                 for s in m.ports.values()],
+                     'signals': [{'name': s.name, 'direction': s.direction, 'width': s.width}
+                                 for s in m.wires.values()]}
+            for m in db.modules.values()}
+        write_json('tree')
         sys.exit(0)
 
     print(col('  Hierarchy : built', C.GREEN))
@@ -1808,13 +1887,13 @@ ENDPOINT FORMAT
                     # name close to an existing port is more likely a typo.
                     similar = get_close_matches(port, list(mod.ports), n=3)
                     if similar:
-                        print(col(f'  WARN row {spec.row_num}: dst port "{port}" '
-                                  f'will be added to module "{n.module_name}", '
-                                  f'which already has a similar port: '
-                                  f'{", ".join(similar)}. Typo?', C.YELLOW))
+                        note(f'  WARN row {spec.row_num}: dst port "{port}" '
+                             f'will be added to module "{n.module_name}", '
+                             f'which already has a similar port: '
+                             f'{", ".join(similar)}. Typo?', C.YELLOW)
                     else:
-                        print(col(f'  NOTE row {spec.row_num}: dst port "{port}" will be '
-                                  f'added to module "{n.module_name}"', C.DIM))
+                        note(f'  NOTE row {spec.row_num}: dst port "{port}" will be '
+                             f'added to module "{n.module_name}"', C.DIM)
 
     # ── Validate destinations ─────────────────────────────────────────────────
     seen_dst: Dict[Tuple[str, str], int] = {}
@@ -1845,9 +1924,9 @@ ENDPOINT FORMAT
                 f'  Row {r}: {where} is an input; it cannot be driven from '
                 f'inside that module.')
         elif si and at_lca:
-            print(col(f'  WARN row {r}: {where} is an existing {si.direction}; '
-                      f'it will be driven by an assign, so make sure nothing '
-                      f'else drives it', C.YELLOW))
+            note(f'  WARN row {r}: {where} is an existing {si.direction}; '
+                 f'it will be driven by an assign, so make sure nothing '
+                 f'else drives it', C.YELLOW)
         elif si and si.direction == 'output':
             validation_errors.append(
                 f'  Row {r}: {where} is an output; a destination must be an input.')
@@ -1866,8 +1945,8 @@ ENDPOINT FORMAT
                     f'times ({", ".join(users)}); rewiring it would change every '
                     f'instance.')
             elif conn:
-                print(col(f'  WARN row {r}: {where} is already connected to '
-                          f'"{conn}"; that connection will be replaced', C.YELLOW))
+                note(f'  WARN row {r}: {where} is already connected to '
+                     f'"{conn}"; that connection will be replaced', C.YELLOW)
 
     if validation_errors:
         print(col('\n  PATH VALIDATION ERRORS:', C.RED, C.BOLD))
@@ -1925,6 +2004,7 @@ ENDPOINT FORMAT
     if not outputs:
         print(col('\n  Nothing to do: no connections and no AUTO_WIRE content '
                   'to remove.', C.YELLOW))
+        write_json('nothing')
         sys.exit(0)
     if cleanup:
         print(col(f'\n  Will remove stale AUTO_WIRE content from {len(cleanup)} '
@@ -1933,15 +2013,41 @@ ENDPOINT FORMAT
 
     # ── Optional LLM review (advisory; never blocks the write-back) ───────────
     llm_lines: Optional[List[str]] = None
+    llm_result: Optional[dict] = None
     if args.llm_review and conns:
         print(col(f'\n  Asking {args.llm_model} to review {len(conns)} '
                   f'connection(s)...', C.DIM))
         found, err = llm_review(db, conns, args.llm_url, args.llm_model,
                                 os.environ.get('AUTOWIRE_LLM_API_KEY', '').strip())
         llm_lines = llm_review_lines(conns, found, err)
+        llm_result = {'model': args.llm_model, 'findings': found, 'error': err}
         print(col(f'\n  LLM REVIEW (advisory, {args.llm_model}):', C.YELLOW, C.BOLD))
         for line in llm_lines:
             print(col(line, C.YELLOW if found or err else C.DIM))
+
+    plan_id, changed_files = plan_report(db, outputs)
+    report.update({
+        'plan_id': plan_id,
+        'connections': [{'row': s.row_num, 'wire_name': s.wire_name,
+                         'src': f'{s.src_path}.{s.src_port}',
+                         'dst': f'{s.dst_path}.{s.dst_port}',
+                         'lca': _lca(s.src_path, s.dst_path),
+                         'bit_width': s.bit_width, 'comment': s.comment}
+                        for s in conns],
+        'mismatches': [{'wire_name': m.wire_name, 'src_port': m.src_port,
+                        'src_width': m.src_w, 'dst_port': m.dst_port,
+                        'dst_width': m.dst_w, 'note': m.note,
+                        'assign': f'assign {m.assign_lhs} = {m.assign_rhs};'}
+                       for m in mismatches],
+        'llm_review': llm_result,
+        'files': changed_files, 'written': []})
+    report['warnings'] += [_ANSI_RE.sub('', w).strip() for w in warn_msgs]
+
+    if args.expect_plan and args.expect_plan != plan_id and not args.dry_run:
+        print(col('\n  PLAN CHANGED: the RTL or the connection list changed since '
+                  'the preview. No files written; preview again.', C.RED, C.BOLD))
+        write_json('stale')
+        sys.exit(EXIT_STALE)
 
     # ── Confirm before writing ────────────────────────────────────────────────
     if not args.dry_run:
@@ -1954,14 +2060,27 @@ ENDPOINT FORMAT
             print(f'    {col(mn, C.WHITE):<28} {col(fp, C.DIM)}')
         print()
 
-        try:
-            ans = input(col('  Proceed with write-back? [Y/n]: ', C.YELLOW)).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = 'n'
+        if args.yes:
+            ans = 'y'
+        else:
+            try:
+                ans = input(col('  Proceed with write-back? [Y/n]: ', C.YELLOW)).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = 'n'
 
         if ans not in ('', 'y', 'yes'):
             print(col('  Aborted. No files written.', C.YELLOW))
+            write_json('aborted')
             sys.exit(0)
+
+        # A file edited while the tool ran would lose that edit; write nothing.
+        edited = [fp for fp in outputs if db.changed_since_scan(fp)]
+        if edited:
+            print(col('\n  RTL CHANGED while the tool was running:', C.RED, C.BOLD))
+            for fp in edited: print(col(f'    {fp}', C.RED))
+            print(col('  No files written; run again.', C.RED))
+            write_json('stale')
+            sys.exit(EXIT_STALE)
 
         # ── Apply changes ─────────────────────────────────────────────────────
         written = 0
@@ -1969,6 +2088,7 @@ ENDPOINT FORMAT
             if not db.same_but_stamps(fp, data):
                 Path(fp).write_bytes(data)
                 print(col(f'  ✓  {fp}', C.GREEN))
+                report['written'].append(fp)
                 written += 1
             else:
                 print(col(f'  ─  {fp}  (unchanged)', C.DIM))
@@ -1977,6 +2097,7 @@ ENDPOINT FORMAT
     else:
         print(col('\n  [DRY RUN]  No files written.', C.YELLOW))
         print()
+        write_json('preview')
         return
 
     # ── Write warning log ─────────────────────────────────────────────────────
@@ -1987,6 +2108,7 @@ ENDPOINT FORMAT
     else:
         print(col(f'  ✓  {warn_log}', C.GREEN))
     print()
+    write_json('written')
 
 
 if __name__ == '__main__':

@@ -39,6 +39,27 @@ python autowire_v3.py -d ./rtl -T TOP -c conn.csv --dry-run   # preview only
 python autowire_v3.py -d ./rtl -T TOP --tree                  # print hierarchy
 ```
 
+### Driving the tool from a script or UI
+```
+python autowire_v3.py -d ./rtl -T TOP -c conn.csv --dry-run --json plan.json
+python autowire_v3.py -d ./rtl -T TOP -c conn.csv --yes --expect-plan <plan_id> --json out.json
+python autowire_v3.py -d ./rtl -T TOP --tree --json tree.json
+```
+- `--yes` writes without the `[Y/n]` prompt.
+- `--json FILE` also writes the result as JSON: `status` (`preview`, `written`,
+  `aborted`, `stale`, `nothing`, `tree`), `connections`, `warnings`,
+  `mismatches`, `llm_review`, `files` (each file that will change, with a
+  unified diff), `written`, and `plan_id`. With `--tree` it holds the hierarchy
+  (`tree`) and every module's ports and internal signals (`modules`). A run
+  that stops on an error leaves no JSON file (an existing FILE is removed when
+  the run starts); the message is on stdout.
+- `plan_id` is a fingerprint of the files as scanned and as they will be
+  written. `--expect-plan ID` writes only if the plan is still the one that was
+  previewed; otherwise nothing is written and the exit status is 3.
+- Independently of these options, a file that changes on disk while the tool
+  is running (e.g. while it waits at the prompt) is never overwritten: the run
+  writes nothing and exits with status 3.
+
 ### Optional LLM review
 `--llm-review` asks an OpenAI-compatible chat API (e.g. a local gpt-oss or
 Qwen served by vLLM or Ollama) to flag connections that look like design
