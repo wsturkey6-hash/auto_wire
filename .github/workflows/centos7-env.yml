@@ -58,11 +58,16 @@ jobs:
             grep tar.xz /w/parts/SHA256SUMS.txt | sha256sum -c -
             mkdir /opt/env
             tar -xJf autowire-env-centos7.tar.xz -C /opt/env
-            /opt/env/bin/python /opt/env/bin/conda-unpack
             /opt/env/bin/python -m compileall -q /opt/env/lib/python3.11 > /dev/null || true
-            /opt/env/bin/python -c "import ssl, pyslang, openpyxl; print(ssl.OPENSSL_VERSION, pyslang.__version__, openpyxl.__version__)"
             cp -r /w/autowire_v3.py /w/tests /w/test_rtl /w/*.csv /tmp/
+            # The environment must work wherever it is copied, without
+            # conda-unpack: run from one place, move it, run again.
             /opt/env/bin/python -m unittest discover -s tests
+            mkdir -p "/srv/some project/moved"
+            mv /opt/env "/srv/some project/moved/env"
+            PY="/srv/some project/moved/env/bin/python"
+            "$PY" -c "import ssl, sqlite3, pyslang, openpyxl; print(ssl.OPENSSL_VERSION, pyslang.__version__, openpyxl.__version__)"
+            "$PY" -m unittest discover -s tests
           '
 
       - uses: actions/upload-artifact@v4
