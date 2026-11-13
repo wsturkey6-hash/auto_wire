@@ -35,7 +35,8 @@ autowire_v3.py  ─  SoC Integration Auto-Wiring Tool  v3.0
   python3 autowire_v3.py --rtl-dir ./rtl --top TOP --csv conn.csv --no-color
 """
 
-import re, os, sys, csv, json, hashlib, argparse, getpass, locale, http.client, urllib.request
+import re, os, sys, csv, json, stat, hashlib, argparse, getpass, locale, tempfile
+import http.client, urllib.request
 from datetime import date as dt_date
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -1450,6 +1451,94 @@ def render_outputs(db: RTLDatabase, cs: ChangeSet, user: str) -> Dict[str, bytes
             outputs[fp] = db.encode_source(fp, text)
     return outputs
 
+class WriteFilesError(Exception):
+    """A write-back failure. `written` lists the files already replaced;
+    `incomplete` names a file whose in-place write was cut short."""
+    def __init__(self, msg: str, written=(), incomplete: Optional[str] = None):
+        super().__init__(msg)
+        self.written = list(written)
+        self.incomplete = incomplete
+
+def _stage_file(target: str, data: bytes) -> Optional[str]:
+    """Write data to a temp file next to target, with target's mode and group.
+    Returns the temp path, or None when the directory does not allow a new
+    file (the caller then writes target in place)."""
+    folder, base = os.path.split(target)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=f'.{base}.', suffix='.awtmp')
+    except PermissionError:
+        return None
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        st = os.stat(target)
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        if hasattr(os, 'chown'):
+            try:
+                os.chown(tmp, -1, st.st_gid)
+            except OSError:
+                pass
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return tmp
+
+def write_files_atomically(items: List[Tuple[str, bytes]], recheck) -> None:
+    """Replace every (path, new bytes) so that no file is ever left half
+    written: stage all new content in temp files, call recheck() (which may
+    stop the run), then swap each temp file in with os.replace. A symlink
+    keeps pointing at its file; a read-only file is refused, as a direct
+    write would be. A file that cannot be staged or swapped for lack of
+    permission (a directory that allows no new file; on Windows, a file open
+    in another program) is written in place instead. Raises WriteFilesError;
+    nothing was touched unless its `written` or `incomplete` is set."""
+    staged: List[Tuple[str, str, Optional[str], bytes]] = []
+    in_place: set = set()                # files written in place, completely
+    incomplete: Optional[str] = None     # in-place write under way
+    try:
+        for fp, data in items:
+            target = os.path.realpath(fp)
+            if not os.access(target, os.W_OK):
+                raise WriteFilesError(f'{fp}: the file is read-only')
+            try:
+                tmp = _stage_file(target, data)
+            except OSError as e:
+                raise WriteFilesError(f'{fp}: {e.strerror or e}') from None
+            staged.append((fp, target, tmp, data))
+        recheck()
+        # Swap in the staged files first; files whose directory allowed no
+        # temp file are written in place last.
+        try:
+            for fp, target, tmp, data in sorted(staged, key=lambda s: s[2] is None):
+                if tmp is not None:
+                    try:
+                        os.replace(tmp, target)
+                        continue
+                    except PermissionError:
+                        pass
+                incomplete = fp
+                Path(target).write_bytes(data)
+                incomplete = None
+                in_place.add(fp)
+        except (Exception, KeyboardInterrupt) as e:
+            if isinstance(e, OSError):
+                reason = e.strerror or str(e)
+            else:
+                reason = 'interrupted' if isinstance(e, KeyboardInterrupt) else type(e).__name__
+            # A staged file is in place exactly when its temp file is gone.
+            written = [f for f, _, t, _ in staged
+                       if f in in_place or (t is not None and not os.path.exists(t))]
+            raise WriteFilesError(f'{fp}: {reason}', written, incomplete) from None
+    finally:
+        for _, _, tmp, _ in staged:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
 def plan_report(db: RTLDatabase, outputs: Dict[str, bytes]) -> Tuple[str, List[dict]]:
     """(plan id, files that will change with their unified diff). The plan id
     is a fingerprint of every file as scanned and as it will be written, with
@@ -2073,25 +2162,47 @@ ENDPOINT FORMAT
             write_json('aborted')
             sys.exit(0)
 
-        # A file edited while the tool ran would lose that edit; write nothing.
-        edited = [fp for fp in outputs if db.changed_since_scan(fp)]
-        if edited:
-            print(col('\n  RTL CHANGED while the tool was running:', C.RED, C.BOLD))
-            for fp in edited: print(col(f'    {fp}', C.RED))
-            print(col('  No files written; run again.', C.RED))
-            write_json('stale')
-            sys.exit(EXIT_STALE)
+        def refuse_if_edited():
+            # A file edited while the tool ran would lose that edit; write nothing.
+            edited = [fp for fp in outputs if db.changed_since_scan(fp)]
+            if edited:
+                print(col('\n  RTL CHANGED while the tool was running:', C.RED, C.BOLD))
+                for fp in edited: print(col(f'    {fp}', C.RED))
+                print(col('  No files written; run again.', C.RED))
+                write_json('stale')
+                sys.exit(EXIT_STALE)
 
         # ── Apply changes ─────────────────────────────────────────────────────
-        written = 0
-        for fp, data in outputs.items():
-            if not db.same_but_stamps(fp, data):
-                Path(fp).write_bytes(data)
+        to_write = [(fp, data) for fp, data in outputs.items()
+                    if not db.same_but_stamps(fp, data)]
+        try:
+            write_files_atomically(to_write, refuse_if_edited)
+        except WriteFilesError as e:
+            print(col(f'\n  WRITE ERROR: {e}', C.RED, C.BOLD))
+            if e.written or e.incomplete:
+                print(col('  Already replaced:', C.RED))
+                for fp in e.written: print(col(f'    {fp}', C.RED))
+                if e.incomplete:
+                    print(col(f'  May be incomplete (check this file): {e.incomplete}', C.RED))
+                print(col('  Not written:', C.RED))
+                for fp, _ in to_write:
+                    if fp not in e.written and fp != e.incomplete:
+                        print(col(f'    {fp}', C.RED))
+                report['written'] = e.written
+                report['incomplete'] = [e.incomplete] if e.incomplete else []
+                write_json('partial')
+            else:
+                print(col('  No files written.', C.RED))
+            sys.exit(1)
+
+        changed = {fp for fp, _ in to_write}
+        for fp in outputs:
+            if fp in changed:
                 print(col(f'  ✓  {fp}', C.GREEN))
                 report['written'].append(fp)
-                written += 1
             else:
                 print(col(f'  ─  {fp}  (unchanged)', C.DIM))
+        written = len(changed)
 
         print(col(f'\n  {written} file(s) written.', C.GREEN if written else C.DIM))
     else:

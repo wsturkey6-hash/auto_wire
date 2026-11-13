@@ -14,10 +14,12 @@ external linter cross-check (skipped if none installed).
 import os
 import re
 import sys
+import contextlib
 import glob
 import io
 import json
 import shutil
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -1614,6 +1616,243 @@ class MachineInterfaceTests(_TmpRTL):
         r = run_tool(self.rtl, self.csv)
         self.assertEqual(r.returncode, 0)
         self.assertFalse(self.json.exists())
+
+
+# ── atomic write-back ────────────────────────────────────────────────────────
+class AtomicWriteTests(_TmpRTL):
+    """The fixture's one connection rewrites leaf.v, mid.v and top.v."""
+
+    def setUp(self):
+        super().setUp()
+        write_fixture(self.rtl)
+        self.csv = write_csv(self.rtl, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,route down")
+        self.json = self.rtl / "out.json"
+        self.before = self.snapshot()
+
+    def run_main(self, *patches):
+        """Run main() in-process with --yes under the given mock patches.
+        Returns (exit status, stdout text)."""
+        argv = ["autowire_v3.py", "-d", str(self.rtl), "-T", "top", "-c", str(self.csv),
+                "--no-color", "--yes", "--json", str(self.json),
+                "--out-log", str(self.rtl / "w.log")]
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            stack.enter_context(mock.patch("sys.stdout", new=out))
+            for p in patches:
+                stack.enter_context(p)
+            try:
+                aw.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, out.getvalue()
+
+    def temps(self):
+        return sorted(p.name for p in self.rtl.rglob("*.awtmp"))
+
+    def report(self):
+        return json.loads(self.json.read_text(encoding="utf-8")) if self.json.exists() else None
+
+    def failing_on_call(self, real, n, exc):
+        calls = []
+
+        def fake(*a, **kw):
+            calls.append(a)
+            if len(calls) == n:
+                raise exc
+            return real(*a, **kw)
+        return fake
+
+    def test_normal_run_leaves_no_temp_files(self):
+        code, out = self.run_main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.temps(), [])
+        self.assertEqual(self.report()["status"], "written")
+        self.assertEqual(len(self.report()["written"]), 3)
+        self.assertNotEqual(self.before, self.snapshot())
+
+    def test_staging_failure_writes_nothing(self):
+        fake = self.failing_on_call(os.fsync, 2, OSError(28, "No space left on device"))
+        code, out = self.run_main(mock.patch("os.fsync", fake))
+        self.assertEqual(code, 1, out)
+        self.assertIn("WRITE ERROR", out)
+        self.assertIn("No files written.", out)
+        self.assertEqual(self.before, self.snapshot())
+        self.assertEqual(self.temps(), [])
+        self.assertIsNone(self.report())
+        self.assertFalse((self.rtl / "w.log").exists())
+
+    def test_partial_commit_is_reported_and_leaves_whole_files(self):
+        fake = self.failing_on_call(os.replace, 2, OSError(5, "Input/output error"))
+        code, out = self.run_main(mock.patch("os.replace", fake))
+        self.assertEqual(code, 1, out)
+        self.assertIn("Already replaced:", out)
+        self.assertEqual(self.report()["incomplete"], [])
+        rep = self.report()
+        self.assertEqual(rep["status"], "partial")
+        self.assertEqual(len(rep["written"]), 1)
+        done = Path(rep["written"][0]).name
+        after = self.snapshot()
+        for name in self.before:
+            if name == done:
+                self.assertNotEqual(after[name], self.before[name], name)
+                self.assertIn(b"AUTO_WIRE_END", after[name])       # complete new content
+            else:
+                self.assertEqual(after[name], self.before[name], name)
+        self.assertEqual(self.temps(), [])
+        self.assertFalse((self.rtl / "w.log").exists())
+
+    def test_interrupt_during_commit_is_reported(self):
+        fake = self.failing_on_call(os.replace, 2, KeyboardInterrupt())
+        code, out = self.run_main(mock.patch("os.replace", fake))
+        self.assertEqual(code, 1, out)
+        self.assertIn("interrupted", out)
+        self.assertEqual(self.report()["status"], "partial")
+        self.assertEqual(self.temps(), [])
+
+    def test_interrupt_right_after_a_replace_still_reports_that_file(self):
+        real, calls = os.replace, []
+
+        def replace_then_interrupt(src, dst):
+            real(src, dst)
+            calls.append(dst)
+            if len(calls) == 2:
+                raise KeyboardInterrupt()
+        code, out = self.run_main(mock.patch("os.replace", replace_then_interrupt))
+        self.assertEqual(code, 1, out)
+        rep = self.report()
+        self.assertEqual(len(rep["written"]), 2)
+        after = self.snapshot()
+        changed = sorted(n for n in after if after[n] != self.before[n])
+        self.assertEqual(changed, sorted(Path(p).name for p in rep["written"]))
+        self.assertEqual(self.temps(), [])
+
+    def test_unexpected_error_during_commit_is_reported_not_raised(self):
+        fake = self.failing_on_call(os.replace, 2, RuntimeError("boom"))
+        code, out = self.run_main(mock.patch("os.replace", fake))
+        self.assertEqual(code, 1, out)
+        self.assertIn("RuntimeError", out)
+        self.assertEqual(len(self.report()["written"]), 1)
+        self.assertEqual(self.temps(), [])
+
+    def test_replace_refused_falls_back_to_in_place(self):
+        """E.g. Windows refuses to replace a file another program has open."""
+        code, out = self.run_main(
+            mock.patch("os.replace", side_effect=PermissionError(13, "Permission denied")))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.report()["status"], "written")
+        self.assertEqual(self.temps(), [])
+        for name, data in self.snapshot().items():
+            self.assertIn(b"AUTO_WIRE_END", data, name)
+
+    def test_cut_short_in_place_write_is_reported_as_incomplete(self):
+        real, calls = Path.write_bytes, []
+
+        def half_write(path, data):
+            if path.suffix == ".v":
+                calls.append(path)
+                if len(calls) == 2:
+                    real(path, data[:len(data) // 2])
+                    raise OSError(28, "No space left on device")
+            return real(path, data)
+        code, out = self.run_main(
+            mock.patch("tempfile.mkstemp", side_effect=PermissionError(13, "Permission denied")),
+            mock.patch.object(Path, "write_bytes", half_write))
+        self.assertEqual(code, 1, out)
+        self.assertIn("May be incomplete", out)
+        rep = self.report()
+        self.assertEqual(rep["status"], "partial")
+        self.assertEqual(len(rep["written"]), 1)
+        self.assertEqual(len(rep["incomplete"]), 1)
+        after = self.snapshot()
+        cut = Path(rep["incomplete"][0]).name
+        self.assertNotIn(cut, [Path(p).name for p in rep["written"]])
+        self.assertNotEqual(after[cut], self.before[cut])
+
+    def test_unwritable_target_is_refused(self):
+        real = os.access
+
+        def fake(path, mode, *a, **kw):
+            if os.path.basename(str(path)) == "mid.v" and mode == os.W_OK:
+                return False
+            return real(path, mode, *a, **kw)
+        code, out = self.run_main(mock.patch("os.access", fake))
+        self.assertEqual(code, 1, out)
+        self.assertIn("read-only", out)
+        self.assertEqual(self.before, self.snapshot())
+        self.assertEqual(self.temps(), [])
+        self.assertIsNone(self.report())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores permission bits, so a read-only file is writable")
+    def test_read_only_file_is_refused(self):
+        mid = self.rtl / "mid.v"
+        mid.chmod(0o444)
+        try:
+            code, out = self.run_main()
+            self.assertEqual(code, 1, out)
+            self.assertIn("read-only", out)
+            self.assertEqual(self.before, self.snapshot())
+            self.assertEqual(self.temps(), [])
+        finally:
+            mid.chmod(0o644)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_mode_is_kept(self):
+        (self.rtl / "mid.v").chmod(0o640)
+        code, out = self.run_main()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(stat.S_IMODE((self.rtl / "mid.v").stat().st_mode), 0o640)
+
+    @unittest.skipUnless(os.name == "posix", "symlinks need no privilege on POSIX")
+    def test_symlinked_file_stays_a_symlink(self):
+        real_dir = Path(tempfile.mkdtemp())
+        try:
+            real = real_dir / "mid_real.v"
+            shutil.move(str(self.rtl / "mid.v"), str(real))
+            (self.rtl / "mid.v").symlink_to(real)
+            code, out = self.run_main()
+            self.assertEqual(code, 0, out)
+            self.assertTrue((self.rtl / "mid.v").is_symlink())
+            self.assertIn("AUTO_WIRE_END", real.read_text())
+            self.assertEqual(sorted(p.name for p in real_dir.iterdir()), ["mid_real.v"])
+        finally:
+            shutil.rmtree(real_dir, ignore_errors=True)
+
+    def test_directory_without_create_permission_falls_back_to_in_place(self):
+        code, out = self.run_main(
+            mock.patch("tempfile.mkstemp", side_effect=PermissionError(13, "Permission denied")))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.report()["status"], "written")
+        expect = Path(tempfile.mkdtemp())
+        try:
+            write_fixture(expect)
+            run_tool(expect, write_csv(expect, "w_data,8,top.data_in,top/u_mid/u_leaf.sink_in,route down"),
+                     extra=("--yes",))
+            self.assertEqual(self.snapshot(), {p.name: p.read_bytes()
+                                               for p in sorted(expect.glob("*.v"))})
+        finally:
+            shutil.rmtree(expect, ignore_errors=True)
+
+    def test_edit_after_staging_writes_nothing(self):
+        top = self.rtl / "top.v"
+        real = os.fsync
+        calls = []
+
+        def fsync_then_edit(fd):
+            real(fd)
+            calls.append(fd)
+            if len(calls) == 3:                         # all three files are staged
+                top.write_bytes(top.read_bytes() + b"// edited meanwhile\n")
+        code, out = self.run_main(mock.patch("os.fsync", fsync_then_edit))
+        self.assertEqual(code, 3, out)
+        self.assertEqual(self.report()["status"], "stale")
+        after = self.snapshot()
+        self.assertEqual(after["top.v"], self.before["top.v"] + b"// edited meanwhile\n")
+        self.assertEqual(after["mid.v"], self.before["mid.v"])
+        self.assertEqual(after["leaf.v"], self.before["leaf.v"])
+        self.assertEqual(self.temps(), [])
 
 
 # ── optional LLM review ──────────────────────────────────────────────────────

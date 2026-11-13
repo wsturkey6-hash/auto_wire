@@ -47,12 +47,15 @@ python autowire_v3.py -d ./rtl -T TOP --tree --json tree.json
 ```
 - `--yes` writes without the `[Y/n]` prompt.
 - `--json FILE` also writes the result as JSON: `status` (`preview`, `written`,
-  `aborted`, `stale`, `nothing`, `tree`), `connections`, `warnings`,
+  `aborted`, `stale`, `nothing`, `tree`, `partial`), `connections`, `warnings`,
   `mismatches`, `llm_review`, `files` (each file that will change, with a
   unified diff), `written`, and `plan_id`. With `--tree` it holds the hierarchy
   (`tree`) and every module's ports and internal signals (`modules`). A run
   that stops on an error leaves no JSON file (an existing FILE is removed when
-  the run starts); the message is on stdout.
+  the run starts) and has touched no RTL file; the message is on stdout. The
+  one exception is `partial` (exit status 1): the write-back failed after it
+  had started. `written` lists the files that were fully replaced and
+  `incomplete` a file whose direct write was cut short (see Limitations).
 - `plan_id` is a fingerprint of the files as scanned and as they will be
   written. `--expect-plan ID` writes only if the plan is still the one that was
   previewed; otherwise nothing is written and the exit status is 3.
@@ -116,6 +119,18 @@ See [`example_connections.csv`](example_connections.csv) for a worked example.
   can't be placed safely, e.g. a module without a port list or an instance with
   an empty or positional connection list, the tool stops with a
   `WRITE-BACK ERROR` and writes no files.
+- The new content of every file goes to a temporary file next to it first, and
+  only then is each file replaced in one step, so a failed or killed run does
+  not leave a file half written. A replaced file keeps its permissions (and
+  group, when possible) and a symlink keeps pointing at its file, but the file
+  is a new one on disk: hard links to the old file are not updated, its owner
+  becomes the user who ran the tool, and on Windows its hidden/system
+  attributes are not kept. A read-only file is refused. Where a file cannot be
+  replaced this way for lack of permission (a directory that allows no new
+  file; on Windows, a file open in another program), it is written directly
+  instead, and only such a direct write can be cut short by a failure; the
+  tool then names the file as possibly incomplete. A run that is killed can
+  leave `.<name>.*.awtmp` files behind; they are safe to delete.
 - Edits go into module definitions, so rewiring an existing connection inside a
   module that is instantiated more than once is refused (it would change every
   instance).
